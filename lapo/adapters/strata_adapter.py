@@ -395,7 +395,7 @@ class StrataAdapter:
         last_heartbeat = time.time()
         was_stopped = False
 
-        # Always decode raw bytes explicitly as UTF-8 (RFC 2616 defaults text/* without charset to ISO-8859-1)
+        # Always decode raw bytes explicitly as UTF-8
         for raw_bytes in resp.iter_lines(decode_unicode=False):
             if stop_event and stop_event.is_set():
                 was_stopped = True
@@ -461,10 +461,14 @@ class StrataAdapter:
             if now - last_heartbeat >= 20.0:
                 r_chars = sum(len(p) for p in reasoning_parts)
                 c_chars = sum(len(p) for p in content_parts)
+                arg_chars = sum(
+                    len((tc.get("function") or {}).get("arguments") or "")
+                    for tc in tool_calls_map.values()
+                )
                 self.events.emit(
                     EventType.LOG,
                     f"  [STREAMING {now - start_ts:.0f}s] Thought: {r_chars} chars | "
-                    f"Output: {c_chars} chars | ToolCalls: {len(tool_calls_map)}",
+                    f"Output: {c_chars} chars | ToolCalls: {len(tool_calls_map)} (Args: {arg_chars} chars)",
                 )
                 last_heartbeat = now
 

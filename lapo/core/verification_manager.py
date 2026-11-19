@@ -1,7 +1,7 @@
 """
 Safe allowlisted command execution (shell=False), built-in unattended auto-verification
-(Python/JSON/Node/TS/Go/Rust), SHA-256 worktree fingerprinting, Git inspection,
-and language-agnostic file contract extraction.
+(Python/JSON/Node/TS/Go/Rust), ANSI output sanitization, SHA-256 worktree fingerprinting,
+Git inspection, and language-agnostic file contract extraction.
 """
 
 from __future__ import annotations
@@ -30,6 +30,8 @@ from lapo.models import (
 
 
 FORBIDDEN_CONTROL_CHARS = set("\n\r\x00")
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07]*\x07|\x1b[@-Z\\-_]")
+
 IGNORED_WALK_DIRS = {
     ".git",
     ".orchestrator",
@@ -43,7 +45,6 @@ IGNORED_WALK_DIRS = {
     ".mypy_cache",
 }
 
-# Safe standard test/check command prefixes allowed automatically in unattended mode (strictly shell=False)
 BUILTIN_SAFE_TEST_PREFIXES: List[Tuple[str, ...]] = [
     ("python", "-m", "unittest"),
     ("python3", "-m", "unittest"),
@@ -85,6 +86,11 @@ _CONTRACT_PATTERNS: Dict[str, re.Pattern[str]] = {
         re.MULTILINE,
     ),
 }
+
+
+def strip_ansi(text: str) -> str:
+    """Remove ANSI terminal color/cursor escape codes from subprocess output."""
+    return _ANSI_ESCAPE_RE.sub("", text or "")
 
 
 def _probe_tcp(proxy_url: str, timeout: float = 1.2) -> bool:
@@ -145,6 +151,7 @@ class VerificationManager:
         env = os.environ.copy()
         env["NO_PROXY"] = NO_PROXY_HOSTS
         env["no_proxy"] = NO_PROXY_HOSTS
+        env["NO_COLOR"] = "1"
 
         active_proxy: Optional[str] = None
         if self.config.primary_proxy and _probe_tcp(self.config.primary_proxy):
@@ -185,7 +192,6 @@ class VerificationManager:
             return False
         for prefix in BUILTIN_SAFE_TEST_PREFIXES:
             if len(norm_tokens) >= len(prefix) and norm_tokens[: len(prefix)] == prefix:
-                # Reject path traversal outside workspace in trailing args
                 for arg in norm_tokens[len(prefix) :]:
                     if ".." in arg.replace("\\", "/").split("/"):
                         return False
@@ -239,12 +245,14 @@ class VerificationManager:
         try:
             proc = self._run_tokens(tokens, timeout_s=timeout_s)
             dur = round(time.time() - start, 3)
+            clean_stdout = strip_ansi(proc.stdout or "")[-4000:]
+            clean_stderr = strip_ansi(proc.stderr or "")[-4000:]
             return VerificationCommandResult(
                 command=cmd_str,
                 exit_code=proc.returncode,
                 passed=(proc.returncode == 0),
-                stdout=(proc.stdout or "")[-4000:],
-                stderr=(proc.stderr or "")[-4000:],
+                stdout=clean_stdout,
+                stderr=clean_stderr,
                 duration_s=dur,
             )
         except Exception as err:
@@ -254,13 +262,10 @@ class VerificationManager:
                 exit_code=-1,
                 passed=False,
                 stdout="",
-                stderr=str(err),
+                stderr=strip_ansi(str(err)),
                 duration_s=dur,
             )
 
-    # ------------------------------------------------------------------
-    # Smart Unattended Auto-Verification (Zero Human Blocking)
-    # ------------------------------------------------------------------
     def _has_python_test_files(self) -> bool:
         for root_dir, dirnames, filenames in os.walk(self.workspace_root):
             dirnames[:] = [d for d in sorted(dirnames) if d not in IGNORED_WALK_DIRS]
@@ -274,15 +279,10 @@ class VerificationManager:
         phase_id: int,
         modified_files: Optional[List[str]] = None,
     ) -> VerificationSuiteResult:
-        """
-        Automatically verify syntax, JSON validity, and auto-detected test suites so
-        long unattended runs never stall waiting for manual approval clicks.
-        """
         fp = self.compute_worktree_fingerprint()
         results: List[VerificationCommandResult] = []
         all_passed = True
 
-        # Collect target files (modified files or all workspace files if empty)
         targets: List[Path] = []
         if modified_files:
             for rel in modified_files:
@@ -297,7 +297,6 @@ class VerificationManager:
                         continue
                     targets.append(Path(root_dir) / fname)
 
-        # 1. Python syntax & bytecode compilation check (fast, in-process, never hangs)
         py_files = [p for p in targets if p.suffix.lower() == ".py"]
         for py_file in py_files:
             rel = py_file.relative_to(self.workspace_root).as_posix()
@@ -322,12 +321,11 @@ class VerificationManager:
                         exit_code=1,
                         passed=False,
                         stdout="",
-                        stderr=str(err),
+                        stderr=strip_ansi(str(err)),
                         duration_s=round(time.time() - t0, 3),
                     )
                 )
 
-        # 2. JSON syntax validation
         json_files = [p for p in targets if p.suffix.lower() == ".json"]
         for jf in json_files:
             rel = jf.relative_to(self.workspace_root).as_posix()
@@ -352,12 +350,11 @@ class VerificationManager:
                         exit_code=1,
                         passed=False,
                         stdout="",
-                        stderr=str(err),
+                        stderr=strip_ansi(str(err)),
                         duration_s=round(time.time() - t0, 3),
                     )
                 )
 
-        # 3. Auto-detected Python unittest suite (if test_*.py exists)
         if self._has_python_test_files():
             cmd = "python -m unittest discover -v"
             self.events.emit(EventType.LOG, f"[AUTO-VERIFY Phase {phase_id}] Running detected Python tests: {cmd}")
@@ -366,7 +363,6 @@ class VerificationManager:
             if not res.passed:
                 all_passed = False
 
-        # 4. Auto-detected TypeScript / Vitest checks
         if (self.workspace_root / "tsconfig.json").is_file() and (
             self.workspace_root / "node_modules" / "typescript" / "bin" / "tsc"
         ).is_file():
@@ -385,7 +381,6 @@ class VerificationManager:
             if not res.passed:
                 all_passed = False
 
-        # 5. Auto-detected Go / Rust checks (only if toolchain installed)
         if (self.workspace_root / "go.mod").is_file() and shutil.which("go"):
             cmd = "go test ./..."
             self.events.emit(EventType.LOG, f"[AUTO-VERIFY Phase {phase_id}] Running: {cmd}")
@@ -402,7 +397,6 @@ class VerificationManager:
             if not res.passed:
                 all_passed = False
 
-        # 6. Non-empty workspace sanity check if no language-specific checks matched
         if not results:
             results.append(
                 VerificationCommandResult(
@@ -474,13 +468,13 @@ class VerificationManager:
                     exit_code=-1,
                     passed=False,
                     stdout="",
-                    stderr=str(err),
+                    stderr=strip_ansi(str(err)),
                     duration_s=0.0,
                 )
             results.append(res)
             if not res.passed:
                 all_passed = False
-                err_preview = (res.stderr or res.stdout or f"exit_code={res.exit_code}").strip()[:300]
+                err_preview = strip_ansi(res.stderr or res.stdout or f"exit_code={res.exit_code}").strip()[:300]
                 self.events.emit(
                     EventType.LOG,
                     f"[VERIFY FAILED Phase {phase_id}] `{cmd}` -> {err_preview}",

@@ -309,8 +309,43 @@ class ProjectOrchestrator:
         }
 
     # ------------------------------------------------------------------
-    # Message Preparation Helpers
+    # Message Preparation & Recovery Helpers
     # ------------------------------------------------------------------
+    @staticmethod
+    def _build_truncated_json_recovery_message(
+        fn_name: str,
+        err: Exception,
+        raw_len: int,
+        streak: int,
+    ) -> str:
+        prefix = ""
+        if streak >= 2:
+            prefix = (
+                f"CRITICAL ANTI-LOOP WARNING (consecutive truncated JSON #{streak}): "
+                f"STOP sending oversized JSON payloads to `{fn_name}`. "
+            )
+
+        if fn_name == "patch_file":
+            return (
+                f"{prefix}Truncated JSON arguments in `patch_file` (received {raw_len} chars; {err}). "
+                "Keep `target_snippet` and `replacement_snippet` short and focused (5 to 15 lines max per call), "
+                'and split multiple edits across small patch calls. If you need to rewrite a large file, emit '
+                '<file path="relative/path.ext">...complete file...</file> directly in plain assistant text instead.'
+            )
+
+        if fn_name == "write_file":
+            return (
+                f"{prefix}Truncated JSON arguments in `write_file` (received {raw_len} chars; {err}). "
+                'Do NOT stuff large source files into JSON tool arguments. Output the complete file directly '
+                'in your plain assistant text using <file path="relative/path.ext">...</file>.'
+            )
+
+        return (
+            f"{prefix}Truncated JSON arguments in `{fn_name}` (received {raw_len} chars; {err}). "
+            'Keep JSON tool arguments concise and valid, or use <file path="relative/path.ext">...</file> '
+            "in plain assistant text for file writes."
+        )
+
     def _build_fresh_phase_messages(
         self,
         continuation_report: Optional[Dict[str, Any]] = None,
@@ -495,6 +530,7 @@ class ProjectOrchestrator:
 
             awaiting_compaction = False
             compaction_prev_tokens = 0
+            consecutive_json_errors = 0
             turns = 0
 
             while not self._stop_event.is_set() and not self._project_finished and turns < max_turns:
@@ -577,6 +613,7 @@ class ProjectOrchestrator:
                     )
                     awaiting_compaction = False
                     compaction_prev_tokens = 0
+                    consecutive_json_errors = 0
                     self.context_manager.reset_tracking()
 
                     fresh_tok, fresh_exact = self.context_manager.count_messages_tokens(
@@ -593,6 +630,7 @@ class ProjectOrchestrator:
                 inline_written, inline_errors = self.tools.extract_and_write_inline_files(content_str)
                 if inline_written:
                     self.usage_ledger.record_inline_files(len(inline_written))
+                    consecutive_json_errors = 0
 
                 native_tool_calls = raw_msg.get("tool_calls") or []
                 text_tool_calls = []
@@ -616,6 +654,7 @@ class ProjectOrchestrator:
 
                         try:
                             fn_args = json.loads(raw_args, strict=False)
+                            consecutive_json_errors = 0
                             self.events.emit(
                                 EventType.TOOL_CALL,
                                 f"[TOOL] {fn_name}({json.dumps(fn_args, ensure_ascii=False)[:140]})",
@@ -623,21 +662,18 @@ class ProjectOrchestrator:
                             )
                             tool_output = self.tools.execute(fn_name, fn_args)
                         except json.JSONDecodeError as je:
+                            consecutive_json_errors += 1
+                            raw_len = len(raw_args)
+                            recovery_msg = self._build_truncated_json_recovery_message(
+                                fn_name, je, raw_len, consecutive_json_errors
+                            )
                             self.events.emit(
                                 EventType.LOG,
-                                f"[TOOL RECOVERY] Truncated JSON in `{fn_name}` ({je}); redirecting model to <file> syntax.",
+                                f"[TOOL RECOVERY] Truncated JSON in `{fn_name}` "
+                                f"(received {raw_len} chars; streak={consecutive_json_errors}; {je}).",
                                 level="warning",
                             )
-                            tool_output = json.dumps(
-                                {
-                                    "error": (
-                                        f"Truncated JSON arguments in `{fn_name}` ({je}). "
-                                        'Output large files directly using <file path="relative/path.ext">...</file> '
-                                        "in your assistant response instead of stuffing long strings into JSON."
-                                    )
-                                },
-                                ensure_ascii=False,
-                            )
+                            tool_output = json.dumps({"error": recovery_msg}, ensure_ascii=False)
 
                         self.events.emit(
                             EventType.TOOL_RESULT,
@@ -672,6 +708,7 @@ class ProjectOrchestrator:
                         self._messages.append({"role": "user", "content": "\n".join(feedback_lines)})
 
                 elif text_tool_calls:
+                    consecutive_json_errors = 0
                     self.usage_ledger.record_tool_calls(len(text_tool_calls))
                     results_summary: List[str] = []
                     for tc in text_tool_calls:
