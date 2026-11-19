@@ -2,6 +2,16 @@
 
 All notable changes to **Local AI Project Orchestrator (LAPO)** are documented in this file.
 
+## [1.0.2] - 2026-11-19
+### Added
+- **GUI & CLI Proxy Failover Controls (`main_window.py`, `cli.py`, `config.py`):** Added Primary/Fallback proxy fields (`Proxy 1`, `Proxy 2`), a live TCP **Test** button, and an **API via Proxy** toggle for remote or tunneled endpoints.
+- **Automatic Private LAN / MikroTik Bypass (`strata_adapter.py`, `config.py`):** Automatically bypasses system/VPN proxies for RFC1918 private LAN IPs (`192.168.x.x`, `10.x.x.x`, `172.16-31.x.x`, `.local`) in addition to loopback so local LAN GPU servers remain reachable.
+- **Trusted Pre-Flight Dependency Bootstrap (`verification_manager.py`, `orchestrator.py`):** Automatically runs `npm install` via the active Primary/Fallback proxy on Start when `package.json` exists and `node_modules/` is missing (controlled by the `Auto-Install Deps` option).
+- **Expanded Test Suite:** Added 5 new unit tests in `tests/test_proxy_and_bootstrap.py` (31 total automated tests).
+
+### Fixed
+- **GUI Config Persistence (`main_window.py`):** `Load Config` and `Save Config` now preserve `primary_proxy`, `fallback_proxy`, `route_api_via_proxy`, `auto_install_deps`, and `allowed_commands`.
+
 ## [1.0.1] - 2026-11-19
 ### Improved
 - **Live Tool Argument Telemetry (`strata_adapter.py`):** Streaming heartbeats now report `ToolCalls: N (Args: X chars)` so long tool-call payloads show real-time generation progress instead of looking stalled.
