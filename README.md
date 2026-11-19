@@ -19,6 +19,10 @@
 
 </div>
 
+
+<img width="1525" height="1038" alt="LAPO" src="https://github.com/user-attachments/assets/e809c572-6d44-46cb-9523-de88ce419010" />
+
+
 ---
 
 ## What is LAPO?
