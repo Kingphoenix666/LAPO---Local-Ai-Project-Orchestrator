@@ -35,8 +35,11 @@ class BoundedStreamPane(ttk.Frame):
         self.max_lines = max_lines
         self._on_font_zoom = on_font_zoom
 
+        # Keep requested height modest so expand=True fills available space without pushing footer off-screen
         self.text = tk.Text(
             self,
+            height=10,
+            width=40,
             wrap="word",
             font=("Consolas", self.font_size),
             state="disabled",
@@ -124,7 +127,6 @@ class BoundedStreamPane(ttk.Frame):
     def append(self, chunk: str, tag: Optional[str] = None) -> None:
         if not chunk:
             return
-        # Check if viewport is currently pinned to bottom
         _, bottom_frac = self.text.yview()
         at_bottom = bottom_frac >= 0.98
 
@@ -134,7 +136,6 @@ class BoundedStreamPane(ttk.Frame):
         else:
             self.text.insert("end", chunk)
 
-        # Enforce bounded line count to keep Tkinter snappy across multi-hour runs
         total_lines = int(self.text.index("end-1c").split(".")[0])
         if total_lines > self.max_lines:
             excess = total_lines - self.max_lines
@@ -164,7 +165,6 @@ class ActivityMonitor(ttk.LabelFrame):
         self.theme = theme_manager
         self._on_font_size_changed = on_font_size_changed
 
-        # Header strip with context gauge
         header = ttk.Frame(self, style="Panel.TFrame")
         header.pack(fill="x", pady=(0, 6))
 
@@ -177,7 +177,6 @@ class ActivityMonitor(ttk.LabelFrame):
         self.btn_clear_all = ttk.Button(header, text="Clear Logs", command=self.clear_all)
         self.btn_clear_all.pack(side="right")
 
-        # 3-tab Notebook
         self.notebook = ttk.Notebook(self)
         self.notebook.pack(fill="both", expand=True)
 

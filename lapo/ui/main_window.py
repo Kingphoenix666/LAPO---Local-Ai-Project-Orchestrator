@@ -51,8 +51,16 @@ class LapoMainWindow:
         self.prefs = load_ui_prefs()
 
         self.root.title(f"{__app_name__} v{__version__}")
-        self.root.geometry("1280x820")
-        self.root.minsize(980, 680)
+
+        # Fit cleanly inside the visible screen area above the taskbar on any DPI scaling
+        screen_w = self.root.winfo_screenwidth()
+        screen_h = self.root.winfo_screenheight()
+        win_w = min(1280, max(940, screen_w - 60))
+        win_h = min(820, max(620, screen_h - 100))
+        pos_x = max(10, (screen_w - win_w) // 2)
+        pos_y = max(10, (screen_h - win_h) // 2 - 15)
+        self.root.geometry(f"{win_w}x{win_h}+{pos_x}+{pos_y}")
+        self.root.minsize(920, 600)
 
         self.theme = ThemeManager(root, initial_theme=self.prefs.get("theme", "dark"))
         self.theme.apply(self.prefs.get("theme", "dark"))
@@ -88,8 +96,9 @@ class LapoMainWindow:
         self.root.after(250, self.fetch_models_async)
 
     def _build_layout(self) -> None:
+        # 1. Top Title & Theme Bar
         top_bar = ttk.Frame(self.root, padding=(12, 8, 12, 4))
-        top_bar.pack(fill="x")
+        top_bar.pack(fill="x", side="top")
 
         ttk.Label(top_bar, text=f"LAPO — Local AI Project Orchestrator v{__version__}", style="Title.TLabel").pack(
             side="left"
@@ -99,8 +108,9 @@ class LapoMainWindow:
         ttk.Button(top_bar, text="💾 Save Config", command=self.export_project_config).pack(side="right", padx=(6, 0))
         ttk.Button(top_bar, text="📂 Load Config", command=self.import_project_config).pack(side="right")
 
+        # 2. Compact Configuration Strip (Server + Paths + Context)
         cfg_strip = ttk.Frame(self.root, padding=(12, 2, 12, 6))
-        cfg_strip.pack(fill="x")
+        cfg_strip.pack(fill="x", side="top")
 
         f_srv = ttk.LabelFrame(cfg_strip, text=" 1. Strata / Local API ", padding=8)
         f_srv.pack(side="left", fill="both", expand=True, padx=(0, 6))
@@ -168,67 +178,10 @@ class LapoMainWindow:
             variable=self.var_unattended_auto_verify,
         ).pack(side="left")
 
-        paned = ttk.PanedWindow(self.root, orient="horizontal")
-        paned.pack(fill="both", expand=True, padx=12, pady=4)
-
-        left_pane = ttk.Frame(paned)
-        paned.add(left_pane, weight=45)
-
-        self.left_notebook = ttk.Notebook(left_pane)
-        self.left_notebook.pack(fill="both", expand=True)
-
-        self.phase_editor = PhaseEditor(
-            self.left_notebook,
-            theme_manager=self.theme,
-            on_phases_changed=self._on_phases_updated,
-        )
-        self.lock_panel = LockPanel(
-            self.left_notebook,
-            get_workspace_dir=self._get_workspace_path_safe,
-            get_active_lock_manager=lambda: self._orchestrator.lock_manager if self._orchestrator else None,
-            on_log=lambda msg, lvl: self.monitor.append_activity(msg, lvl),
-        )
-        self.left_notebook.add(self.phase_editor, text=" Phase Builder ")
-        self.left_notebook.add(self.lock_panel, text=" Final / Locked Files ")
-
-        right_pane = ttk.Frame(paned)
-        paned.add(right_pane, weight=55)
-
-        self.monitor = ActivityMonitor(
-            right_pane,
-            theme_manager=self.theme,
-            initial_font_size=int(self.prefs.get("font_size", 10)),
-            on_font_size_changed=self._on_font_size_changed,
-        )
-        self.monitor.pack(fill="both", expand=True)
-
-        f_live = ttk.LabelFrame(right_pane, text=" Live Mid-Flight User Request (user_request.json -> readed_) ", padding=6)
-        f_live.pack(fill="x", pady=(6, 0))
-
-        live_top = ttk.Frame(f_live, style="Panel.TFrame")
-        live_top.pack(fill="x", pady=(0, 4))
-        ttk.Label(live_top, text="Target Phase:").pack(side="left")
-        self.combo_live_phase = ttk.Combobox(
-            live_top,
-            textvariable=self.var_live_phase,
-            values=("active", "1"),
-            state="readonly",
-            width=12,
-        )
-        self.combo_live_phase.pack(side="left", padx=(4, 8))
-        ttk.Button(
-            live_top,
-            text="⚡ Send Live Request",
-            style="Warning.TButton",
-            command=self.send_live_request,
-        ).pack(side="right")
-
-        self.live_prompt_text = tk.Text(f_live, height=3, wrap="word", font=("Consolas", 9))
-        self.theme.style_text_widget(self.live_prompt_text)
-        self.live_prompt_text.pack(fill="x")
-
+        # 3. Persistent Footer Execution Controls — packed BEFORE `paned` so it is NEVER clipped!
         footer = ttk.Frame(self.root, padding=(12, 8, 12, 10))
         footer.pack(fill="x", side="bottom")
+        ttk.Separator(self.root, orient="horizontal").pack(fill="x", side="bottom")
 
         self.btn_start = ttk.Button(footer, text="🚀 Start", style="Success.TButton", command=self.start_execution)
         self.btn_start.pack(side="left", padx=(0, 6))
@@ -260,6 +213,67 @@ class LapoMainWindow:
             side="left", padx=(4, 12)
         )
         ttk.Label(footer, textvariable=self.var_status, style="Bg.TLabel").pack(side="right")
+
+        # 4. Main Split Workspace (packed LAST so it strictly fills remaining middle space)
+        paned = ttk.PanedWindow(self.root, orient="horizontal")
+        paned.pack(fill="both", expand=True, padx=12, pady=4)
+
+        left_pane = ttk.Frame(paned)
+        paned.add(left_pane, weight=45)
+
+        self.left_notebook = ttk.Notebook(left_pane)
+        self.left_notebook.pack(fill="both", expand=True)
+
+        self.phase_editor = PhaseEditor(
+            self.left_notebook,
+            theme_manager=self.theme,
+            on_phases_changed=self._on_phases_updated,
+        )
+        self.lock_panel = LockPanel(
+            self.left_notebook,
+            get_workspace_dir=self._get_workspace_path_safe,
+            get_active_lock_manager=lambda: self._orchestrator.lock_manager if self._orchestrator else None,
+            on_log=lambda msg, lvl: self.monitor.append_activity(msg, lvl),
+        )
+        self.left_notebook.add(self.phase_editor, text=" Phase Builder ")
+        self.left_notebook.add(self.lock_panel, text=" Final / Locked Files ")
+
+        right_pane = ttk.Frame(paned)
+        paned.add(right_pane, weight=55)
+
+        # Pack Live Request bar BEFORE monitor so it is also never clipped on compact screens
+        f_live = ttk.LabelFrame(right_pane, text=" Live Mid-Flight User Request (user_request.json -> readed_) ", padding=6)
+        f_live.pack(side="bottom", fill="x", pady=(6, 0))
+
+        live_top = ttk.Frame(f_live, style="Panel.TFrame")
+        live_top.pack(fill="x", pady=(0, 4))
+        ttk.Label(live_top, text="Target Phase:").pack(side="left")
+        self.combo_live_phase = ttk.Combobox(
+            live_top,
+            textvariable=self.var_live_phase,
+            values=("active", "1"),
+            state="readonly",
+            width=12,
+        )
+        self.combo_live_phase.pack(side="left", padx=(4, 8))
+        ttk.Button(
+            live_top,
+            text="⚡ Send Live Request",
+            style="Warning.TButton",
+            command=self.send_live_request,
+        ).pack(side="right")
+
+        self.live_prompt_text = tk.Text(f_live, height=2, wrap="word", font=("Consolas", 9))
+        self.theme.style_text_widget(self.live_prompt_text)
+        self.live_prompt_text.pack(fill="x")
+
+        self.monitor = ActivityMonitor(
+            right_pane,
+            theme_manager=self.theme,
+            initial_font_size=int(self.prefs.get("font_size", 10)),
+            on_font_size_changed=self._on_font_size_changed,
+        )
+        self.monitor.pack(fill="both", expand=True)
 
         self._on_phases_updated(self.phase_editor.get_phases(), self.phase_editor.is_plan_locked)
 
