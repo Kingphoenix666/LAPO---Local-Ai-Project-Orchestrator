@@ -1,4 +1,9 @@
-"""Resilient Strata / OpenAI-compatible HTTP & SSE adapter with loopback proxy bypass."""
+"""
+Resilient Strata / OpenAI-compatible HTTP & SSE adapter with:
+- Automatic loopback & private LAN (e.g. MikroTik 192.168.x.x / 10.x.x.x) proxy bypass
+- Optional explicit Primary -> Fallback proxy routing for remote/segmented LLM endpoints
+- Explicit UTF-8 SSE streaming and live tool-argument progress telemetry
+"""
 
 from __future__ import annotations
 
@@ -15,7 +20,12 @@ from urllib.parse import urlparse
 
 import requests
 
-from lapo.config import LOCAL_BYPASS_PROXIES, RuntimeConfig
+from lapo.config import (
+    LOCAL_BYPASS_PROXIES,
+    RuntimeConfig,
+    is_private_network_url,
+    resolve_active_proxy,
+)
 from lapo.events import EventBus, EventType
 from lapo.models import ModelAvailability, ModelInfo
 
@@ -70,13 +80,41 @@ class StrataAdapter:
     """
     Handles model discovery, server telemetry, exact POST /tokenize counting,
     resilient UTF-8 SSE streaming (reasoning + content + fragmented tool_calls),
-    and verified model unload.
+    smart LAN/proxy routing, and verified model unload.
     """
 
     def __init__(self, config: RuntimeConfig, event_bus: Optional[EventBus] = None) -> None:
         self.config = config
         self.events = event_bus or EventBus()
-        self._proxies = LOCAL_BYPASS_PROXIES if is_loopback_url(config.api_base_url) else None
+        self._proxies, self.api_route_summary = self._resolve_request_proxies()
+
+    def _resolve_request_proxies(self) -> Tuple[Optional[Dict[str, Optional[str]]], str]:
+        """
+        Determine exact proxy dictionary for LLM API requests:
+        1. Loopback (127.0.0.1/localhost/::1): ALWAYS direct bypass.
+        2. Explicit `route_api_via_proxy=True`: route via active Primary -> Fallback proxy.
+        3. Private LAN (192.168.x.x / 10.x.x.x / 172.16-31.x.x / .local): direct bypass so
+           OS VPN/proxy never breaks LAN/MikroTik private-IP model servers.
+        4. Public/External URL with configured proxies: use active Primary -> Fallback proxy.
+        """
+        url = self.config.api_base_url
+        if is_loopback_url(url):
+            return LOCAL_BYPASS_PROXIES, "direct (loopback bypass)"
+
+        if self.config.route_api_via_proxy:
+            active, label = resolve_active_proxy(self.config.primary_proxy, self.config.fallback_proxy)
+            if active:
+                return {"http": active, "https": active}, f"proxy ({label}: {active})"
+            return LOCAL_BYPASS_PROXIES, "direct (configured proxy unreachable)"
+
+        if is_private_network_url(url):
+            return LOCAL_BYPASS_PROXIES, "direct (private LAN / MikroTik bypass)"
+
+        active, label = resolve_active_proxy(self.config.primary_proxy, self.config.fallback_proxy)
+        if active:
+            return {"http": active, "https": active}, f"proxy ({label}: {active})"
+
+        return None, "system default"
 
     @property
     def _headers(self) -> Dict[str, str]:
@@ -105,7 +143,6 @@ class StrataAdapter:
     # Model Discovery (Strata CLI inventory + Live API /v1/models)
     # ------------------------------------------------------------------
     def _query_strata_cli_installed_models(self) -> Dict[str, Dict[str, Any]]:
-        """Query `strata models list --installed --output json` with plain-text fallback."""
         strata_bin = _resolve_cli_binary("strata")
         if not strata_bin:
             return {}
@@ -261,7 +298,7 @@ class StrataAdapter:
     # Server Inspection & Exact Context Detection
     # ------------------------------------------------------------------
     def inspect_server(self) -> ServerInspection:
-        metadata: Dict[str, Any] = {}
+        metadata: Dict[str, Any] = {"api_route": self.api_route_summary}
         detected_ctx: Optional[int] = None
         reachable = False
 
@@ -395,7 +432,6 @@ class StrataAdapter:
         last_heartbeat = time.time()
         was_stopped = False
 
-        # Always decode raw bytes explicitly as UTF-8
         for raw_bytes in resp.iter_lines(decode_unicode=False):
             if stop_event and stop_event.is_set():
                 was_stopped = True

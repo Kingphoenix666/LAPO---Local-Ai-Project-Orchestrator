@@ -143,6 +143,14 @@ def _load_config_from_args(args: argparse.Namespace) -> Tuple[RuntimeConfig, Opt
         file_data["tool_protocol"] = args.tool_protocol
     if getattr(args, "manual_approval", False):
         file_data["unattended_auto_verify"] = False
+    if getattr(args, "primary_proxy", None):
+        file_data["primary_proxy"] = args.primary_proxy
+    if getattr(args, "fallback_proxy", None):
+        file_data["fallback_proxy"] = args.fallback_proxy
+    if getattr(args, "route_api_via_proxy", False):
+        file_data["route_api_via_proxy"] = True
+    if getattr(args, "no_auto_install_deps", False):
+        file_data["auto_install_deps"] = False
 
     cfg = RuntimeConfig.from_dict(file_data)
     return cfg, phases
@@ -326,6 +334,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_unlock.add_argument("--reason", default="User authorized repair via CLI")
 
     def _add_exec_args(p: argparse.ArgumentParser) -> None:
+        
         p.add_argument("--config", help="Path to project.json")
         p.add_argument("--workspace", help="Workspace directory path")
         p.add_argument("--skills", help="Optional read-only Skills directory path")
@@ -340,6 +349,18 @@ def build_parser() -> argparse.ArgumentParser:
             "--manual-approval",
             action="store_true",
             help="Require manual approval between phases when no verification commands are configured",
+        )
+        p.add_argument("--primary-proxy", help="Primary HTTP/SOCKS proxy (e.g. 192.168.1.3:38861)")
+        p.add_argument("--fallback-proxy", help="Fallback HTTP/SOCKS proxy (e.g. 192.168.1.6:33877)")
+        p.add_argument(
+            "--route-api-via-proxy",
+            action="store_true",
+            help="Route LLM API calls through the configured proxy (for remote/tunneled servers)",
+        )
+        p.add_argument(
+            "--no-auto-install-deps",
+            action="store_true",
+            help="Skip automatic pre-flight npm install when node_modules is missing",
         )
         p.add_argument("--non-interactive", action="store_true", help="Disable interactive CLI prompts")
 

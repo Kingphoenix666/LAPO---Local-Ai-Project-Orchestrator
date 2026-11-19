@@ -1,7 +1,8 @@
 """
 Main Desktop GUI window for Local AI Project Orchestrator (LAPO).
 Uses 100% of the shared core engine (`ProjectOrchestrator`) via thread-safe EventBus polling.
-Never touches Tkinter widgets directly from background threads.
+Includes Proxy 1 / Proxy 2 failover controls, API-via-Proxy routing toggle, Test Proxy button,
+and pre-flight dependency auto-install.
 """
 
 from __future__ import annotations
@@ -19,6 +20,8 @@ from lapo.config import (
     DEFAULT_API_KEY,
     SUPPORTED_TOOL_PROTOCOLS,
     RuntimeConfig,
+    normalize_proxy_url,
+    probe_proxy_tcp,
 )
 from lapo.core.live_request_manager import publish_live_request_file
 from lapo.core.orchestrator import ProjectOrchestrator
@@ -52,7 +55,6 @@ class LapoMainWindow:
 
         self.root.title(f"{__app_name__} v{__version__}")
 
-        # Fit cleanly inside the visible screen area above the taskbar on any DPI scaling
         screen_w = self.root.winfo_screenwidth()
         screen_h = self.root.winfo_screenheight()
         win_w = min(1280, max(940, screen_w - 60))
@@ -69,11 +71,17 @@ class LapoMainWindow:
         self._orchestrator: Optional[ProjectOrchestrator] = None
         self._worker_thread: Optional[threading.Thread] = None
         self._discovered_models: Dict[str, ModelInfo] = {}
+        self._loaded_allowed_commands: List[str] = []
 
         self.var_api_url = tk.StringVar(value=self.prefs.get("last_api_url") or DEFAULT_API_BASE_URL)
         self.var_api_key = tk.StringVar(value=DEFAULT_API_KEY)
         self.var_model_display = tk.StringVar(value="")
         self.var_conn_status = tk.StringVar(value="Not checked")
+
+        # Network / Proxy routing fields
+        self.var_primary_proxy = tk.StringVar(value=self.prefs.get("last_primary_proxy", ""))
+        self.var_fallback_proxy = tk.StringVar(value=self.prefs.get("last_fallback_proxy", ""))
+        self.var_route_api_via_proxy = tk.BooleanVar(value=bool(self.prefs.get("last_route_api_via_proxy", False)))
 
         self.var_workspace = tk.StringVar(value=self.prefs.get("last_workspace", ""))
         self.var_skills = tk.StringVar(value=self.prefs.get("last_skills", ""))
@@ -84,6 +92,7 @@ class LapoMainWindow:
         self.var_read_timeout = tk.StringVar(value="5400")
         self.var_tool_protocol = tk.StringVar(value="auto")
         self.var_unattended_auto_verify = tk.BooleanVar(value=True)
+        self.var_auto_install_deps = tk.BooleanVar(value=True)
 
         self.var_live_phase = tk.StringVar(value="active")
         self.var_status = tk.StringVar(value="Status: Ready")
@@ -108,29 +117,45 @@ class LapoMainWindow:
         ttk.Button(top_bar, text="💾 Save Config", command=self.export_project_config).pack(side="right", padx=(6, 0))
         ttk.Button(top_bar, text="📂 Load Config", command=self.import_project_config).pack(side="right")
 
-        # 2. Compact Configuration Strip (Server + Paths + Context)
+        # 2. Compact Configuration Strip (Server + Network Proxy + Paths + Context)
         cfg_strip = ttk.Frame(self.root, padding=(12, 2, 12, 6))
         cfg_strip.pack(fill="x", side="top")
 
-        f_srv = ttk.LabelFrame(cfg_strip, text=" 1. Strata / Local API ", padding=8)
+        f_srv = ttk.LabelFrame(cfg_strip, text=" 1. Strata / Local API & Network Routing ", padding=8)
         f_srv.pack(side="left", fill="both", expand=True, padx=(0, 6))
 
         r0 = ttk.Frame(f_srv, style="Panel.TFrame")
         r0.pack(fill="x", pady=(0, 4))
         ttk.Label(r0, text="API URL:", width=8).pack(side="left")
-        ttk.Entry(r0, textvariable=self.var_api_url, width=28).pack(side="left", fill="x", expand=True, padx=(0, 6))
+        ttk.Entry(r0, textvariable=self.var_api_url, width=26).pack(side="left", fill="x", expand=True, padx=(0, 6))
         ttk.Label(r0, text="Key:").pack(side="left")
-        ttk.Entry(r0, textvariable=self.var_api_key, width=12, show="*").pack(side="left", padx=(4, 0))
+        ttk.Entry(r0, textvariable=self.var_api_key, width=11, show="*").pack(side="left", padx=(4, 0))
 
         r1 = ttk.Frame(f_srv, style="Panel.TFrame")
-        r1.pack(fill="x")
+        r1.pack(fill="x", pady=(0, 4))
         self.btn_fetch = ttk.Button(r1, text="🔄 Fetch Models", style="Accent.TButton", command=self.fetch_models_async)
         self.btn_fetch.pack(side="left", padx=(0, 6))
-        self.combo_models = ttk.Combobox(r1, textvariable=self.var_model_display, state="readonly", width=32)
+        self.combo_models = ttk.Combobox(r1, textvariable=self.var_model_display, state="readonly", width=30)
         self.combo_models.pack(side="left", fill="x", expand=True)
 
-        self.lbl_conn = ttk.Label(f_srv, textvariable=self.var_conn_status, style="Muted.TLabel")
-        self.lbl_conn.pack(anchor="w", pady=(4, 0))
+        r2 = ttk.Frame(f_srv, style="Panel.TFrame")
+        r2.pack(fill="x", pady=(0, 4))
+        ttk.Label(r2, text="Proxy 1:").pack(side="left")
+        ttk.Entry(r2, textvariable=self.var_primary_proxy, width=18).pack(side="left", fill="x", expand=True, padx=(3, 6))
+        ttk.Label(r2, text="Proxy 2:").pack(side="left")
+        ttk.Entry(r2, textvariable=self.var_fallback_proxy, width=18).pack(side="left", fill="x", expand=True, padx=(3, 6))
+        self.btn_test_proxy = ttk.Button(r2, text="Test", width=5, command=self.test_proxies_async)
+        self.btn_test_proxy.pack(side="left")
+
+        r3 = ttk.Frame(f_srv, style="Panel.TFrame")
+        r3.pack(fill="x")
+        ttk.Checkbutton(
+            r3,
+            text="API via Proxy (remote)",
+            variable=self.var_route_api_via_proxy,
+        ).pack(side="left", padx=(0, 8))
+        self.lbl_conn = ttk.Label(r3, textvariable=self.var_conn_status, style="Muted.TLabel")
+        self.lbl_conn.pack(side="left", fill="x", expand=True)
 
         f_paths = ttk.LabelFrame(cfg_strip, text=" 2. Workspace, Skills & Context Safety ", padding=8)
         f_paths.pack(side="left", fill="both", expand=True)
@@ -174,8 +199,13 @@ class LapoMainWindow:
         p3.pack(fill="x")
         ttk.Checkbutton(
             p3,
-            text="Auto-Verify & Continue Between Phases (Unattended Mode — no manual approval popups)",
+            text="Auto-Verify (Unattended)",
             variable=self.var_unattended_auto_verify,
+        ).pack(side="left", padx=(0, 12))
+        ttk.Checkbutton(
+            p3,
+            text="Auto-Install Deps (npm via Proxy on Start)",
+            variable=self.var_auto_install_deps,
         ).pack(side="left")
 
         # 3. Persistent Footer Execution Controls — packed BEFORE `paned` so it is NEVER clipped!
@@ -214,7 +244,7 @@ class LapoMainWindow:
         )
         ttk.Label(footer, textvariable=self.var_status, style="Bg.TLabel").pack(side="right")
 
-        # 4. Main Split Workspace (packed LAST so it strictly fills remaining middle space)
+        # 4. Main Split Workspace
         paned = ttk.PanedWindow(self.root, orient="horizontal")
         paned.pack(fill="both", expand=True, padx=12, pady=4)
 
@@ -241,7 +271,6 @@ class LapoMainWindow:
         right_pane = ttk.Frame(paned)
         paned.add(right_pane, weight=55)
 
-        # Pack Live Request bar BEFORE monitor so it is also never clipped on compact screens
         f_live = ttk.LabelFrame(right_pane, text=" Live Mid-Flight User Request (user_request.json -> readed_) ", padding=6)
         f_live.pack(side="bottom", fill="x", pady=(6, 0))
 
@@ -294,6 +323,9 @@ class LapoMainWindow:
         self.prefs["last_api_url"] = self.var_api_url.get().strip()
         self.prefs["last_workspace"] = self.var_workspace.get().strip()
         self.prefs["last_skills"] = self.var_skills.get().strip()
+        self.prefs["last_primary_proxy"] = self.var_primary_proxy.get().strip()
+        self.prefs["last_fallback_proxy"] = self.var_fallback_proxy.get().strip()
+        self.prefs["last_route_api_via_proxy"] = bool(self.var_route_api_via_proxy.get())
         save_ui_prefs(self.prefs)
 
     def _browse_workspace(self) -> None:
@@ -355,9 +387,47 @@ class LapoMainWindow:
             compaction_threshold_pct=pct_val,
             max_gen_tokens=int(self.var_max_gen.get().strip() or "32768"),
             unattended_auto_verify=bool(self.var_unattended_auto_verify.get()),
+            auto_install_deps=bool(self.var_auto_install_deps.get()),
             read_timeout_s=int(self.var_read_timeout.get().strip() or "5400"),
             tool_protocol=self.var_tool_protocol.get().strip() or "auto",
+            primary_proxy=self.var_primary_proxy.get().strip() or None,
+            fallback_proxy=self.var_fallback_proxy.get().strip() or None,
+            route_api_via_proxy=bool(self.var_route_api_via_proxy.get()),
+            allowed_commands=list(self._loaded_allowed_commands),
         )
+
+    def test_proxies_async(self) -> None:
+        p1 = normalize_proxy_url(self.var_primary_proxy.get())
+        p2 = normalize_proxy_url(self.var_fallback_proxy.get())
+        if not p1 and not p2:
+            self.var_conn_status.set("No proxy configured (direct mode)")
+            self.monitor.append_activity("[PROXY] No Primary or Fallback proxy configured (direct connection).", "info")
+            return
+
+        self._persist_basic_prefs()
+        self.btn_test_proxy.configure(state="disabled")
+        self.var_conn_status.set("Testing proxies...")
+
+        def _worker() -> None:
+            parts: List[str] = []
+            any_ok = False
+            if p1:
+                ok1 = probe_proxy_tcp(p1, timeout=1.5)
+                any_ok = any_ok or ok1
+                parts.append(f"P1 {'OK' if ok1 else 'FAIL'} ({p1})")
+            if p2:
+                ok2 = probe_proxy_tcp(p2, timeout=1.5)
+                any_ok = any_ok or ok2
+                parts.append(f"P2 {'OK' if ok2 else 'FAIL'} ({p2})")
+            summary = " | ".join(parts)
+            self.root.after(0, lambda: self._on_proxy_test_done(summary, any_ok))
+
+        threading.Thread(target=_worker, name="LAPO-ProxyTest", daemon=True).start()
+
+    def _on_proxy_test_done(self, summary: str, any_ok: bool) -> None:
+        self.btn_test_proxy.configure(state="normal")
+        self.var_conn_status.set(summary[:90])
+        self.monitor.append_activity(f"[PROXY TEST] {summary}", "success" if any_ok else "error")
 
     def export_project_config(self) -> None:
         try:
@@ -404,13 +474,24 @@ class LapoMainWindow:
             self.var_max_gen.set(str(data["max_gen_tokens"]))
         if data.get("unattended_auto_verify") is not None:
             self.var_unattended_auto_verify.set(bool(data["unattended_auto_verify"]))
+        if data.get("auto_install_deps") is not None:
+            self.var_auto_install_deps.set(bool(data["auto_install_deps"]))
         if data.get("read_timeout_s") is not None:
             self.var_read_timeout.set(str(data["read_timeout_s"]))
         if data.get("tool_protocol"):
             self.var_tool_protocol.set(str(data["tool_protocol"]))
+
+        self.var_primary_proxy.set(str(data.get("primary_proxy") or ""))
+        self.var_fallback_proxy.set(str(data.get("fallback_proxy") or ""))
+        self.var_route_api_via_proxy.set(bool(data.get("route_api_via_proxy", False)))
+        self._loaded_allowed_commands = [
+            str(c).strip() for c in (data.get("allowed_commands") or []) if str(c).strip()
+        ]
+
         if isinstance(data.get("phases"), list) and data["phases"]:
             self.phase_editor.set_phases(data["phases"], locked=False)
 
+        self._persist_basic_prefs()
         self.lock_panel.refresh_from_disk()
         self.fetch_models_async(preferred_model_id=data.get("model_name"))
         self.monitor.append_activity(f"Loaded project config from {path}", "success")
@@ -422,18 +503,30 @@ class LapoMainWindow:
             messagebox.showerror("Invalid URL", "Please enter an API Base URL (e.g. http://127.0.0.1:47831/v1).")
             return
 
+        p1 = self.var_primary_proxy.get().strip() or None
+        p2 = self.var_fallback_proxy.get().strip() or None
+        via_proxy = bool(self.var_route_api_via_proxy.get())
+
         self._persist_basic_prefs()
         self.var_conn_status.set(f"Querying {url}/models ...")
         self.btn_fetch.configure(state="disabled")
 
         def _worker() -> None:
             try:
-                tmp_cfg = RuntimeConfig(workspace_dir=Path.cwd(), api_base_url=url, api_key=key)
+                tmp_cfg = RuntimeConfig(
+                    workspace_dir=Path.cwd(),
+                    api_base_url=url,
+                    api_key=key,
+                    primary_proxy=p1,
+                    fallback_proxy=p2,
+                    route_api_via_proxy=via_proxy,
+                )
                 adapter = StrataAdapter(tmp_cfg)
                 models, err = adapter.discover_models()
-                self.root.after(0, lambda: self._apply_discovered_models(models, err, preferred_model_id))
+                route_note = adapter.api_route_summary
+                self.root.after(0, lambda: self._apply_discovered_models(models, err, preferred_model_id, route_note))
             except Exception as exc:
-                self.root.after(0, lambda: self._apply_discovered_models([], str(exc), preferred_model_id))
+                self.root.after(0, lambda: self._apply_discovered_models([], str(exc), preferred_model_id, ""))
 
         threading.Thread(target=_worker, name="LAPO-ModelDiscovery", daemon=True).start()
 
@@ -442,6 +535,7 @@ class LapoMainWindow:
         models: List[ModelInfo],
         error: Optional[str],
         preferred_model_id: Optional[str],
+        route_note: str = "",
     ) -> None:
         self.btn_fetch.configure(state="normal")
         self._discovered_models.clear()
@@ -463,15 +557,17 @@ class LapoMainWindow:
                         break
             self.combo_models.current(chosen_idx)
             active_count = sum(1 for m in models if m.availability != ModelAvailability.INSTALLED_NOT_LOADED)
-            status = f"Connected — {active_count} active, {len(models)} total discovered"
+            status = f"{active_count} active / {len(models)} total"
+            if route_note:
+                status += f" [{route_note}]"
             if error:
-                status += f" (API note: {error[:80]})"
-            self.var_conn_status.set(status)
+                status += f" (note: {error[:60]})"
+            self.var_conn_status.set(status[:95])
             self.monitor.append_activity(f"[MODELS] {status}", "success" if not error else "warning")
         else:
             self.var_model_display.set("")
-            msg = f"Unreachable / no models: {error or 'empty list'}"
-            self.var_conn_status.set(msg[:110])
+            msg = f"Unreachable: {error or 'empty list'}"
+            self.var_conn_status.set(msg[:95])
             self.monitor.append_activity(f"[MODELS] {msg}", "warning")
 
     def send_live_request(self) -> None:

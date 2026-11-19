@@ -23,8 +23,8 @@ class TestV101Improvements(unittest.TestCase):
     def tearDown(self) -> None:
         self.tmp.cleanup()
 
-    def test_version_is_1_0_1(self) -> None:
-        self.assertEqual(lapo.__version__, "1.0.1")
+    def test_version_is_1_0_2(self) -> None:
+        self.assertEqual(lapo.__version__, "1.0.2")
 
     def test_strip_ansi_cleans_vitest_output(self) -> None:
         dirty = "\x1b[31m\x1b[1mAssertionError\x1b[22m: expected 565 to be 4661\x1b[39m\n\x1b[2m > \x1b[22mtests/hardware.test.ts"

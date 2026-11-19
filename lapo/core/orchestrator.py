@@ -480,6 +480,16 @@ class ProjectOrchestrator:
                     raise ValueError("Cannot start a new run without phase definitions.")
                 plan = self.phase_manager.create_plan(raw_phases)
 
+            self.events.emit(
+                EventType.LOG,
+                f"[NETWORK] API route: {self.adapter.api_route_summary} | "
+                f"Subprocess proxies: primary={self.config.primary_proxy or 'none'}, "
+                f"fallback={self.config.fallback_proxy or 'none'}",
+                level="info",
+            )
+            if self.config.auto_install_deps:
+                self.verification_manager.bootstrap_workspace_dependencies()
+
             inspection = self.adapter.inspect_server()
             if not inspection.reachable:
                 raise RuntimeError(f"Inference server unreachable at {self.config.api_base_url}: {inspection.error}")

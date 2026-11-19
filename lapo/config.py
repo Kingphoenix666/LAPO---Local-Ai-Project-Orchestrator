@@ -1,22 +1,26 @@
-"""Dynamic runtime configuration for LAPO (zero hardcoded project/port assumptions)."""
+"""Dynamic runtime configuration, proxy failover utilities, and private-LAN detection for LAPO."""
 
 from __future__ import annotations
 
+import ipaddress
 import os
 import re
+import socket
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
+from urllib.parse import urlparse
 
 
 ContextSetting = Union[str, int]  # "auto" or integer token ceiling
 
 DEFAULT_API_BASE_URL = "http://127.0.0.1:47831/v1"
 DEFAULT_API_KEY = "strata-local"
-NO_PROXY_HOSTS = "127.0.0.1,localhost,::1"
+NO_PROXY_HOSTS = "127.0.0.1,localhost,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"
 LOCAL_BYPASS_PROXIES: Dict[str, Optional[str]] = {"http": None, "https": None}
 
 SUPPORTED_TOOL_PROTOCOLS = ("auto", "native", "text")
+_PROXY_SCHEME_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.-]*://")
 
 
 def parse_context_size(raw: Union[str, int, None]) -> ContextSetting:
@@ -75,6 +79,73 @@ def derive_server_root_url(base_url: str) -> str:
     return cleaned
 
 
+def normalize_proxy_url(raw: Optional[str]) -> Optional[str]:
+    """Normalize proxy strings like `192.168.1.3:38861` -> `http://192.168.1.3:38861`."""
+    if raw is None:
+        return None
+    cleaned = str(raw).strip().rstrip("/")
+    if not cleaned:
+        return None
+    if not _PROXY_SCHEME_RE.match(cleaned):
+        cleaned = f"http://{cleaned}"
+    return cleaned
+
+
+def is_private_network_url(url: str) -> bool:
+    """True for loopback, RFC1918/private LAN IPs (e.g. MikroTik 192.168.x.x / 10.x.x.x), or .local hosts."""
+    try:
+        host = (urlparse(url).hostname or "").strip().lower()
+        if not host:
+            return False
+        if host in {"127.0.0.1", "localhost", "::1"} or host.endswith(".local"):
+            return True
+        ip = ipaddress.ip_address(host)
+        return bool(ip.is_private or ip.is_loopback or ip.is_link_local)
+    except ValueError:
+        return False
+    except Exception:
+        return False
+
+
+def probe_proxy_tcp(proxy_url: Optional[str], timeout: float = 1.2) -> bool:
+    """Fast TCP connectivity check for an HTTP/SOCKS proxy endpoint."""
+    norm = normalize_proxy_url(proxy_url)
+    if not norm:
+        return False
+    try:
+        parsed = urlparse(norm)
+        host = parsed.hostname
+        port = parsed.port
+        if not host or not port:
+            return False
+        with socket.create_connection((host, int(port)), timeout=timeout):
+            return True
+    except Exception:
+        return False
+
+
+def resolve_active_proxy(
+    primary_proxy: Optional[str],
+    fallback_proxy: Optional[str],
+    timeout: float = 1.2,
+) -> Tuple[Optional[str], str]:
+    """
+    Test primary proxy first, then fallback proxy.
+    Returns `(active_proxy_url, route_label)` where route_label is one of:
+    'primary', 'fallback', 'none_configured', or 'unreachable_direct'.
+    """
+    p1 = normalize_proxy_url(primary_proxy)
+    p2 = normalize_proxy_url(fallback_proxy)
+    if not p1 and not p2:
+        return None, "none_configured"
+
+    if p1 and probe_proxy_tcp(p1, timeout=timeout):
+        return p1, "primary"
+    if p2 and probe_proxy_tcp(p2, timeout=timeout):
+        return p2, "fallback"
+    return None, "unreachable_direct"
+
+
 @dataclass
 class RuntimeConfig:
     """Complete dynamic configuration shared by CLI and Desktop GUI."""
@@ -93,8 +164,9 @@ class RuntimeConfig:
     max_gen_tokens: int = 32768
     max_tool_output_chars: int = 32000
 
-    # Autonomous verification (default True: never block unattended runs on human clicks)
+    # Autonomous execution controls
     unattended_auto_verify: bool = True
+    auto_install_deps: bool = True
 
     # Inference & resilience parameters
     temperature: float = 0.15
@@ -104,9 +176,10 @@ class RuntimeConfig:
     max_api_retries: int = 5
     retry_backoff_s: int = 20
 
-    # Optional external proxies for verification subprocesses (loopback always bypassed)
+    # Proxy & network routing (used for subprocesses/internet & optionally for API calls)
     primary_proxy: Optional[str] = None
     fallback_proxy: Optional[str] = None
+    route_api_via_proxy: bool = False
 
     # Execution safety & verification allowlist
     allowed_commands: List[str] = field(default_factory=list)
@@ -122,6 +195,8 @@ class RuntimeConfig:
 
         self.api_base_url = normalize_api_base_url(self.api_base_url)
         self.context_setting = parse_context_size(self.context_setting)
+        self.primary_proxy = normalize_proxy_url(self.primary_proxy)
+        self.fallback_proxy = normalize_proxy_url(self.fallback_proxy)
 
         if self.tool_protocol not in SUPPORTED_TOOL_PROTOCOLS:
             raise ValueError(
@@ -209,12 +284,16 @@ class RuntimeConfig:
             "hard_force_pct": self.hard_force_pct,
             "max_gen_tokens": self.max_gen_tokens,
             "unattended_auto_verify": self.unattended_auto_verify,
+            "auto_install_deps": self.auto_install_deps,
             "temperature": self.temperature,
             "tool_protocol": self.tool_protocol,
             "connect_timeout_s": self.connect_timeout_s,
             "read_timeout_s": self.read_timeout_s,
             "max_api_retries": self.max_api_retries,
             "retry_backoff_s": self.retry_backoff_s,
+            "primary_proxy": self.primary_proxy,
+            "fallback_proxy": self.fallback_proxy,
+            "route_api_via_proxy": self.route_api_via_proxy,
             "allowed_commands": list(self.allowed_commands),
         }
 
@@ -248,6 +327,7 @@ class RuntimeConfig:
             max_gen_tokens=int(data.get("max_gen_tokens", 32768)),
             max_tool_output_chars=int(data.get("max_tool_output_chars", 32000)),
             unattended_auto_verify=bool(data.get("unattended_auto_verify", True)),
+            auto_install_deps=bool(data.get("auto_install_deps", True)),
             temperature=float(data.get("temperature", 0.15)),
             tool_protocol=str(data.get("tool_protocol", "auto")),
             connect_timeout_s=int(data.get("connect_timeout_s", 30)),
@@ -256,6 +336,7 @@ class RuntimeConfig:
             retry_backoff_s=int(data.get("retry_backoff_s", 20)),
             primary_proxy=data.get("primary_proxy"),
             fallback_proxy=data.get("fallback_proxy"),
+            route_api_via_proxy=bool(data.get("route_api_via_proxy", False)),
             allowed_commands=list(data.get("allowed_commands", [])),
             max_file_size_bytes=int(data.get("max_file_size_bytes", 5 * 1024 * 1024)),
             live_request_poll_s=float(data.get("live_request_poll_s", 1.0)),

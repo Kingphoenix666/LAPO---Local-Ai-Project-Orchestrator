@@ -1,7 +1,7 @@
 """
-Safe allowlisted command execution (shell=False), built-in unattended auto-verification
-(Python/JSON/Node/TS/Go/Rust), ANSI output sanitization, SHA-256 worktree fingerprinting,
-Git inspection, and language-agnostic file contract extraction.
+Safe allowlisted command execution (shell=False), trusted pre-flight workspace dependency
+bootstrap (using Primary -> Fallback proxy), unattended smart auto-verification,
+ANSI sanitization, SHA-256 worktree fingerprinting, Git inspection, and contract extraction.
 """
 
 from __future__ import annotations
@@ -13,14 +13,13 @@ import py_compile
 import re
 import shlex
 import shutil
-import socket
 import subprocess
 import sys
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from lapo.config import NO_PROXY_HOSTS, RuntimeConfig
+from lapo.config import NO_PROXY_HOSTS, RuntimeConfig, resolve_active_proxy
 from lapo.events import EventBus, EventType
 from lapo.models import (
     VerificationCommandResult,
@@ -93,16 +92,6 @@ def strip_ansi(text: str) -> str:
     return _ANSI_ESCAPE_RE.sub("", text or "")
 
 
-def _probe_tcp(proxy_url: str, timeout: float = 1.2) -> bool:
-    try:
-        clean = proxy_url.split("://")[-1].strip("/")
-        host, port_str = clean.split(":")
-        with socket.create_connection((host, int(port_str)), timeout=timeout):
-            return True
-    except Exception:
-        return False
-
-
 def resolve_executable(bin_name: str) -> str:
     stem = Path(bin_name).stem.lower()
     if stem in ("python", "python3"):
@@ -137,8 +126,8 @@ def _strip_matching_outer_quotes(token: str) -> str:
 
 class VerificationManager:
     """
-    Runs strictly allowlisted commands AND unattended smart auto-verification
-    (syntax checks + auto-detected test suites) with shell=False.
+    Runs strictly allowlisted commands, trusted pre-flight workspace dependency bootstrap,
+    and unattended smart auto-verification with shell=False.
     """
 
     def __init__(self, config: RuntimeConfig, event_bus: Optional[EventBus] = None) -> None:
@@ -147,17 +136,15 @@ class VerificationManager:
         self.events = event_bus or EventBus()
         self.last_suite_result: Optional[VerificationSuiteResult] = None
 
-    def _build_subprocess_env(self) -> Dict[str, str]:
+    def _build_subprocess_env(self, active_proxy_override: Optional[str] = None) -> Dict[str, str]:
         env = os.environ.copy()
         env["NO_PROXY"] = NO_PROXY_HOSTS
         env["no_proxy"] = NO_PROXY_HOSTS
         env["NO_COLOR"] = "1"
 
-        active_proxy: Optional[str] = None
-        if self.config.primary_proxy and _probe_tcp(self.config.primary_proxy):
-            active_proxy = self.config.primary_proxy
-        elif self.config.fallback_proxy and _probe_tcp(self.config.fallback_proxy):
-            active_proxy = self.config.fallback_proxy
+        active_proxy = active_proxy_override
+        if active_proxy is None:
+            active_proxy, _ = resolve_active_proxy(self.config.primary_proxy, self.config.fallback_proxy)
 
         if active_proxy:
             env["HTTP_PROXY"] = active_proxy
@@ -165,6 +152,75 @@ class VerificationManager:
             env["http_proxy"] = active_proxy
             env["https_proxy"] = active_proxy
         return env
+
+    def bootstrap_workspace_dependencies(self, timeout_s: int = 300) -> Optional[Dict[str, Any]]:
+        """
+        Trusted Orchestrator-side pre-flight check (never callable by LLM tools).
+        If `package.json` exists in Workspace while `node_modules/` is missing or empty,
+        automatically runs `npm install` via Primary -> Fallback proxy before execution starts.
+        """
+        pkg_json = self.workspace_root / "package.json"
+        if not pkg_json.is_file():
+            return None
+
+        node_modules = self.workspace_root / "node_modules"
+        if node_modules.is_dir():
+            try:
+                if any(node_modules.iterdir()):
+                    return {"status": "already_installed", "tool": "npm"}
+            except OSError:
+                pass
+
+        active_proxy, route_label = resolve_active_proxy(
+            self.config.primary_proxy,
+            self.config.fallback_proxy,
+        )
+        route_msg = f"{route_label} ({active_proxy})" if active_proxy else route_label
+        self.events.emit(
+            EventType.STATUS,
+            f"Installing missing Node dependencies (`npm install`) via {route_msg}...",
+            level="info",
+        )
+        self.events.emit(
+            EventType.LOG,
+            f"[BOOTSTRAP] Detected package.json with missing node_modules. Running `npm install` via {route_msg}...",
+            level="info",
+        )
+
+        npm_exe = resolve_executable("npm")
+        argv = [npm_exe, "install"]
+        if active_proxy:
+            argv.extend(["--proxy", active_proxy, "--https-proxy", active_proxy])
+
+        start = time.time()
+        proc = subprocess.run(
+            argv,
+            cwd=self.workspace_root,
+            env=self._build_subprocess_env(active_proxy_override=active_proxy or ""),
+            shell=False,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=timeout_s,
+            encoding="utf-8",
+            errors="replace",
+        )
+        dur = round(time.time() - start, 2)
+        if proc.returncode != 0:
+            err_tail = strip_ansi(proc.stderr or proc.stdout or f"exit_code={proc.returncode}").strip()[-600:]
+            self.events.emit(
+                EventType.LOG,
+                f"[BOOTSTRAP FAILED] `npm install` failed in {dur}s: {err_tail}",
+                level="error",
+            )
+            raise RuntimeError(f"Pre-flight `npm install` failed (exit {proc.returncode}): {err_tail}")
+
+        self.events.emit(
+            EventType.LOG,
+            f"[BOOTSTRAP] `npm install` completed cleanly in {dur}s (route: {route_msg}).",
+            level="success",
+        )
+        return {"status": "installed", "tool": "npm", "proxy_route": route_msg, "duration_s": dur}
 
     @staticmethod
     def _parse_safe_tokens(cmd_str: str) -> List[str]:
