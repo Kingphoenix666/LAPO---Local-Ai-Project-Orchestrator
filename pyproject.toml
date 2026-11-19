@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "local-ai-project-orchestrator"
+version = "1.0.0"
+description = "Local AI Project Orchestrator (LAPO) — Multi-phase supervisory execution engine for local LLMs (Strata & OpenAI-compatible APIs)."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "requests>=2.31.0",
+    "jsonschema>=4.20.0",
+]
+keywords = ["llm", "orchestrator", "strata", "local-ai", "agent", "autonomous", "openai-compatible"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Environment :: Win32 (MS Windows)",
+    "Environment :: X11 Applications",
+    "Intended Audience :: Developers",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Build Tools",
+]
+
+[project.scripts]
+lapo = "lapo_app:main"
+
+[tool.setuptools]
+py-modules = ["lapo_app"]
+
+[tool.setuptools.packages.find]
+include = ["lapo*"]

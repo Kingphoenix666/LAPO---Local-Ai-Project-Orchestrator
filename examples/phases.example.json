@@ -1,0 +1,19 @@
+[
+  {
+    "name": "Phase 1: Data Models & Math Engine",
+    "prompt": "Implement the foundational data models and core calculation engine with complete unit tests.",
+    "verification_commands": [
+      "python -m unittest discover -v"
+    ]
+  },
+  {
+    "name": "Phase 2: Service & Persistence Layer",
+    "prompt": "Read the locked Phase 1 interfaces and implement persistence and service workflows synchronized with those contracts.",
+    "verification_commands": []
+  },
+  {
+    "name": "Phase 3: CLI / UI & Final Verification",
+    "prompt": "Build the user-facing interface, verify end-to-end execution, and summarize step-by-step usage instructions.",
+    "verification_commands": []
+  }
+]

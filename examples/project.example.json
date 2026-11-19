@@ -1,0 +1,33 @@
+{
+  "workspace_dir": "./my_project_workspace",
+  "skills_dir": null,
+  "api_base_url": "http://127.0.0.1:47831/v1",
+  "model_name": "",
+  "context_setting": "auto",
+  "compaction_threshold_pct": 0.75,
+  "min_no_compact_pct": 0.50,
+  "hard_force_pct": 0.85,
+  "max_gen_tokens": 32768,
+  "unattended_auto_verify": true,
+  "temperature": 0.15,
+  "tool_protocol": "auto",
+  "connect_timeout_s": 30,
+  "read_timeout_s": 5400,
+  "max_api_retries": 5,
+  "retry_backoff_s": 20,
+  "allowed_commands": [],
+  "phases": [
+    {
+      "name": "Phase 1: Core Architecture",
+      "prompt": "Create the core module interfaces and write unit tests verifying all public functions.",
+      "verification_commands": [
+        "python -m unittest discover -v"
+      ]
+    },
+    {
+      "name": "Phase 2: Application Entry & Integration",
+      "prompt": "Read the locked Phase 1 modules, build the application entry point, run tests, and document how to execute the final project.",
+      "verification_commands": []
+    }
+  ]
+}
