@@ -51,16 +51,29 @@ BUILTIN_SAFE_TEST_PREFIXES: List[Tuple[str, ...]] = [
     ("python3", "-m", "pytest"),
     ("python", "-m", "py_compile"),
     ("python3", "-m", "py_compile"),
+    ("python", "-m", "pip", "install"),
+    ("python3", "-m", "pip", "install"),
     ("pytest",),
-    ("npx", "tsc", "--noEmit"),
-    ("npx", "vitest", "run"),
-    ("npx", "vite", "build"),
+    ("node", "--version"),
+    ("node", "-v"),
+    ("node", "--check"),
+    ("npm", "--version"),
+    ("npm", "-v"),
+    ("npm", "init"),
+    ("npm", "install"),
+    ("npm", "ci"),
     ("npm", "test"),
     ("npm", "run", "build"),
     ("npm", "run", "test"),
-    ("node", "--check"),
+    ("npx", "tsc", "--noEmit"),
+    ("npx", "vitest", "run"),
+    ("npx", "vite", "build"),
+    ("go", "mod", "init"),
+    ("go", "mod", "tidy"),
     ("go", "test"),
     ("go", "vet"),
+    ("cargo", "init"),
+    ("cargo", "build"),
     ("cargo", "check"),
     ("cargo", "test"),
 ]
@@ -151,6 +164,8 @@ class VerificationManager:
             env["HTTPS_PROXY"] = active_proxy
             env["http_proxy"] = active_proxy
             env["https_proxy"] = active_proxy
+            env["npm_config_proxy"] = active_proxy
+            env["npm_config_https_proxy"] = active_proxy
         return env
 
     def bootstrap_workspace_dependencies(self, timeout_s: int = 300) -> Optional[Dict[str, Any]]:
@@ -278,7 +293,7 @@ class VerificationManager:
         self,
         cmd_str: str,
         allowlist: List[str],
-        timeout_s: int = 120,
+        timeout_s: int = 300,
     ) -> VerificationCommandResult:
         tokens = self._parse_safe_tokens(cmd_str)
         norm_target = self._normalize_command(tokens)
