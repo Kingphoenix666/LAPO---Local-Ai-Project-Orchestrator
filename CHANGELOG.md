@@ -2,7 +2,9 @@
 
 All notable changes to **Local AI Project Orchestrator (LAPO)** are documented in this file.
 
-## [1.0.2] - 2026-11-19
+## [1.0.3] - 2026-11-23
+### Fixed
+- **Universal Thinking Stream Parsing (`lapo/adapters/strata_adapter.py`):** Added support for the `thinking` delta/message field alongside `reasoning_content` and `reasoning`, plus an incremental `_InlineThinkSplitter` to separate inline `<think>...</think>` and `<thought>...</thought>` tags (including tags split across SSE chunks and non-streaming responses) into the live Thinking Stream tab.## [1.0.2] - 2026-11-19
 ### Added
 - **GUI & CLI Proxy Failover Controls (`main_window.py`, `cli.py`, `config.py`):** Added Primary/Fallback proxy fields (`Proxy 1`, `Proxy 2`), a live TCP **Test** button, and an **API via Proxy** toggle for remote or tunneled endpoints.
 - **Automatic Private LAN / MikroTik Bypass (`strata_adapter.py`, `config.py`):** Automatically bypasses system/VPN proxies for RFC1918 private LAN IPs (`192.168.x.x`, `10.x.x.x`, `172.16-31.x.x`, `.local`) in addition to loopback so local LAN GPU servers remain reachable.

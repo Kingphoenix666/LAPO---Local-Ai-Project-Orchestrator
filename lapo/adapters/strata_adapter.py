@@ -2,7 +2,8 @@
 Resilient Strata / OpenAI-compatible HTTP & SSE adapter with:
 - Automatic loopback & private LAN (e.g. MikroTik 192.168.x.x / 10.x.x.x) proxy bypass
 - Optional explicit Primary -> Fallback proxy routing for remote/segmented LLM endpoints
-- Explicit UTF-8 SSE streaming and live tool-argument progress telemetry
+- Explicit UTF-8 SSE streaming (reasoning_content / reasoning / thinking / inline <think> tags)
+  and live tool-argument progress telemetry
 """
 
 from __future__ import annotations
@@ -53,6 +54,73 @@ def _resolve_cli_binary(name: str) -> Optional[str]:
     if not found and os.name == "nt":
         found = shutil.which(f"{name}.exe") or shutil.which(f"{name}.cmd")
     return found
+
+
+class _InlineThinkSplitter:
+    """
+    Separates <think>...</think> and <thought>...</thought> blocks streamed
+    inside `delta.content` (or non-streaming `message.content`), even when
+    tags are split across SSE chunk boundaries.
+    """
+
+    _OPEN_TAGS = ("<think>", "<thought>")
+    _CLOSE_TAGS = ("</think>", "</thought>")
+
+    def __init__(self) -> None:
+        self.in_think = False
+        self._buf = ""
+
+    def feed(self, text: str) -> Tuple[str, str]:
+        if not text:
+            return "", ""
+        self._buf += text
+        r_out: List[str] = []
+        c_out: List[str] = []
+
+        while self._buf:
+            tags = self._CLOSE_TAGS if self.in_think else self._OPEN_TAGS
+            lower_buf = self._buf.lower()
+            best_idx = -1
+            best_tag = ""
+            for tag in tags:
+                idx = lower_buf.find(tag)
+                if idx != -1 and (best_idx == -1 or idx < best_idx):
+                    best_idx = idx
+                    best_tag = tag
+
+            if best_idx != -1:
+                before = self._buf[:best_idx]
+                if before:
+                    (r_out if self.in_think else c_out).append(before)
+                self._buf = self._buf[best_idx + len(best_tag):]
+                self.in_think = not self.in_think
+                continue
+
+            # Hold back any trailing substring that could be the prefix of an opening/closing tag
+            keep = 0
+            max_len = max(len(t) for t in tags) - 1
+            start_scan = max(0, len(lower_buf) - max_len)
+            for i in range(start_scan, len(lower_buf)):
+                tail = lower_buf[i:]
+                if any(t.startswith(tail) for t in tags):
+                    keep = len(tail)
+                    break
+
+            emit_len = len(self._buf) - keep
+            if emit_len > 0:
+                chunk = self._buf[:emit_len]
+                (r_out if self.in_think else c_out).append(chunk)
+                self._buf = self._buf[emit_len:]
+            break
+
+        return "".join(r_out), "".join(c_out)
+
+    def flush(self) -> Tuple[str, str]:
+        if not self._buf:
+            return "", ""
+        rem = self._buf
+        self._buf = ""
+        return (rem, "") if self.in_think else ("", rem)
 
 
 @dataclass
@@ -425,6 +493,7 @@ class StrataAdapter:
     ) -> Tuple[Dict[str, Any], str, Dict[str, Any], Dict[str, Any], bool]:
         reasoning_parts: List[str] = []
         content_parts: List[str] = []
+        think_splitter = _InlineThinkSplitter()
         tool_calls_map: Dict[int, Dict[str, Any]] = {}
         finish_reason = "stop"
         usage_data: Dict[str, Any] = {}
@@ -465,15 +534,24 @@ class StrataAdapter:
 
             delta = choice.get("delta") or {}
 
-            r_delta = delta.get("reasoning_content") or delta.get("reasoning")
-            if r_delta:
+            r_delta = (
+                delta.get("reasoning_content")
+                or delta.get("reasoning")
+                or delta.get("thinking")
+            )
+            if isinstance(r_delta, str) and r_delta:
                 reasoning_parts.append(r_delta)
                 self.events.emit(EventType.THINKING_DELTA, r_delta)
 
             c_delta = delta.get("content")
-            if c_delta:
-                content_parts.append(c_delta)
-                self.events.emit(EventType.CONTENT_DELTA, c_delta)
+            if isinstance(c_delta, str) and c_delta:
+                r_inline, c_clean = think_splitter.feed(c_delta)
+                if r_inline:
+                    reasoning_parts.append(r_inline)
+                    self.events.emit(EventType.THINKING_DELTA, r_inline)
+                if c_clean:
+                    content_parts.append(c_clean)
+                    self.events.emit(EventType.CONTENT_DELTA, c_clean)
 
             if delta.get("tool_calls"):
                 for tc_delta in delta["tool_calls"]:
@@ -507,6 +585,14 @@ class StrataAdapter:
                     f"Output: {c_chars} chars | ToolCalls: {len(tool_calls_map)} (Args: {arg_chars} chars)",
                 )
                 last_heartbeat = now
+
+        r_tail, c_tail = think_splitter.flush()
+        if r_tail:
+            reasoning_parts.append(r_tail)
+            self.events.emit(EventType.THINKING_DELTA, r_tail)
+        if c_tail:
+            content_parts.append(c_tail)
+            self.events.emit(EventType.CONTENT_DELTA, c_tail)
 
         content_str = "".join(content_parts)
         has_tools = len(tool_calls_map) > 0
@@ -600,12 +686,27 @@ class StrataAdapter:
                         timings = data.get("timings") or {}
                         stopped = False
 
-                        r_text = msg.get("reasoning_content") or msg.get("reasoning")
-                        if r_text:
+                        r_text = (
+                            msg.get("reasoning_content")
+                            or msg.get("reasoning")
+                            or msg.get("thinking")
+                            or ""
+                        )
+                        raw_content = msg.get("content") or ""
+                        if not r_text and isinstance(raw_content, str) and raw_content:
+                            sp = _InlineThinkSplitter()
+                            r1, c1 = sp.feed(raw_content)
+                            r2, c2 = sp.flush()
+                            if r1 or r2:
+                                r_text = r1 + r2
+                                raw_content = c1 + c2
+                                msg["content"] = raw_content
+
+                        if isinstance(r_text, str) and r_text:
                             msg["reasoning_content"] = r_text
                             self.events.emit(EventType.THINKING_DELTA, r_text)
-                        if msg.get("content"):
-                            self.events.emit(EventType.CONTENT_DELTA, msg["content"])
+                        if isinstance(raw_content, str) and raw_content:
+                            self.events.emit(EventType.CONTENT_DELTA, raw_content)
 
                 elapsed = time.time() - start_ts
                 return ChatCompletionResult(

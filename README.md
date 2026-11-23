@@ -4,7 +4,7 @@
 
 **Turn local LLMs (Strata, llama.cpp, LM Studio, vLLM) into reliable, unattended, multi-phase engineering agents.**
 
-[![Version](https://img.shields.io/badge/Version-1.0.2-2f81f7?style=flat-square)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/Version-1.0.3-2f81f7?style=flat-square)](CHANGELOG.md)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-3776ab?style=flat-square&logo=python&logoColor=white)](pyproject.toml)
 [![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux-2ea043?style=flat-square)](#quick-start)
 [![Interfaces](https://img.shields.io/badge/Interface-Desktop%20GUI%20%2B%20CLI-d29922?style=flat-square)](#quick-start)
