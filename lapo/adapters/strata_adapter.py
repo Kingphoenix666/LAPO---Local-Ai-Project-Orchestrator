@@ -123,6 +123,27 @@ class _InlineThinkSplitter:
         return (rem, "") if self.in_think else ("", rem)
 
 
+ENGINE_STARTING = "ENGINE_STARTING"
+ENGINE_READY = "ENGINE_READY"
+ENGINE_REQUEST_FAILED = "ENGINE_REQUEST_FAILED"
+ENGINE_RESTARTING = "ENGINE_RESTARTING"
+ENGINE_TERMINATED = "ENGINE_TERMINATED"
+
+_TERMINATED_MARKERS = (
+    "engine terminated",
+    "stopped restarting",
+    "restart limit",
+    "max restarts",
+    "crashed 3 times",
+    "crash limit",
+    "permanently stopped",
+)
+
+
+class EngineTerminatedError(RuntimeError):
+    """Raised when the inference engine has permanently terminated (e.g. Strata 0.1.67 3-crash cap)."""
+
+
 @dataclass
 class ServerInspection:
     reachable: bool
@@ -131,6 +152,8 @@ class ServerInspection:
     supports_tokenize: bool = False
     server_metadata: Dict[str, Any] = field(default_factory=dict)
     error: Optional[str] = None
+    engine_version: Optional[str] = None
+    engine_state: str = ENGINE_READY
 
 
 @dataclass
@@ -142,6 +165,9 @@ class ChatCompletionResult:
     elapsed_s: float = 0.0
     retries_used: int = 0
     was_stopped: bool = False
+    watchdog_triggered: bool = False
+    watchdog_reason: Optional[str] = None
+    engine_state: str = ENGINE_READY
 
 
 class StrataAdapter:
@@ -404,10 +430,23 @@ class StrataAdapter:
                 except (TypeError, ValueError):
                     pass
 
-        status = self._safe_get_json(f"{self.config.server_url}/status")
-        if isinstance(status, dict):
-            reachable = True
-            metadata["status"] = status
+        engine_version: Optional[str] = None
+        status_obj: Optional[Dict[str, Any]] = None
+        for status_url in (f"{self.config.api_base_url}/status", f"{self.config.server_url}/status"):
+            st = self._safe_get_json(status_url)
+            if isinstance(st, dict):
+                reachable = True
+                status_obj = st
+                metadata["status"] = st
+                if st.get("engine"):
+                    engine_version = str(st["engine"])
+                if detected_ctx is None:
+                    for ctx_key in ("cache_max_tokens", "context", "max_context", "n_ctx"):
+                        raw_c = st.get(ctx_key)
+                        if isinstance(raw_c, int) and raw_c >= 2048:
+                            detected_ctx = raw_c
+                            break
+                break
 
         api_ok, api_map, api_err = self._query_api_models()
         active_ids = list(api_map.keys())
@@ -422,14 +461,56 @@ class StrataAdapter:
 
         _, tok_exact = self.count_tokens("hello")
 
+        engine_state, state_detail = self._classify_engine_state(status_obj, reachable=reachable)
+        if engine_state == ENGINE_TERMINATED and state_detail:
+            metadata["engine_state_detail"] = state_detail
+
         return ServerInspection(
             reachable=reachable,
             detected_context_tokens=detected_ctx,
             active_model_ids=active_ids,
             supports_tokenize=tok_exact,
             server_metadata=metadata,
-            error=None if reachable else (api_err or f"Cannot reach {self.config.api_base_url}"),
+            error=state_detail if engine_state == ENGINE_TERMINATED else (None if reachable else (api_err or f"Cannot reach {self.config.api_base_url}")),
+            engine_version=engine_version,
+            engine_state=engine_state,
         )
+
+    @staticmethod
+    def _classify_engine_state(status: Optional[Dict[str, Any]], reachable: bool) -> Tuple[str, Optional[str]]:
+        if not isinstance(status, dict):
+            return (ENGINE_READY, None) if reachable else (ENGINE_REQUEST_FAILED, "Server unreachable")
+        blob_parts = [
+            str(status.get("state") or ""),
+            str(status.get("status") or ""),
+            str(status.get("activity") or ""),
+            str(status.get("error") or ""),
+            str(status.get("engine_error") or ""),
+            str(status.get("service") or ""),
+        ]
+        blob = " ".join(blob_parts).lower()
+        if any(m in blob for m in _TERMINATED_MARKERS) or status.get("terminated") is True:
+            return ENGINE_TERMINATED, (str(status.get("error") or status.get("engine_error") or "Engine terminated after repeated crashes."))
+        if "restarting" in blob:
+            return ENGINE_RESTARTING, "Engine restarting"
+        if "starting" in blob or "loading" in blob:
+            return ENGINE_STARTING, "Engine starting/loading model"
+        if status.get("loaded") is False and (status.get("error") or status.get("engine_error")):
+            return ENGINE_TERMINATED, str(status.get("error") or status.get("engine_error"))
+        return ENGINE_READY, None
+
+    def probe_engine_state(self) -> Tuple[str, Optional[str]]:
+        for status_url in (f"{self.config.api_base_url}/status", f"{self.config.server_url}/status"):
+            st = self._safe_get_json(status_url, timeout=5.0)
+            if isinstance(st, dict):
+                return self._classify_engine_state(st, reachable=True)
+        return ENGINE_REQUEST_FAILED, "Status endpoint unreachable"
+
+    def fetch_strata_metrics(self) -> Optional[Dict[str, Any]]:
+        if not getattr(self.config, "strata_telemetry_enabled", True):
+            return None
+        data = self._safe_get_json(f"{self.config.server_url}/metrics", timeout=6.0)
+        return data if isinstance(data, dict) else None
 
     # ------------------------------------------------------------------
     # Exact Pre-Flight Token Counting (POST /tokenize + Fallback)
@@ -490,6 +571,7 @@ class StrataAdapter:
         resp: requests.Response,
         start_ts: float,
         stop_event: Optional[threading.Event] = None,
+        thought_watchdog_max_chars: int = 0,
     ) -> Tuple[Dict[str, Any], str, Dict[str, Any], Dict[str, Any], bool]:
         reasoning_parts: List[str] = []
         content_parts: List[str] = []
@@ -500,6 +582,7 @@ class StrataAdapter:
         timings_data: Dict[str, Any] = {}
         last_heartbeat = time.time()
         was_stopped = False
+        r_chars_live = 0
 
         for raw_bytes in resp.iter_lines(decode_unicode=False):
             if stop_event and stop_event.is_set():
@@ -541,6 +624,7 @@ class StrataAdapter:
             )
             if isinstance(r_delta, str) and r_delta:
                 reasoning_parts.append(r_delta)
+                r_chars_live += len(r_delta)
                 self.events.emit(EventType.THINKING_DELTA, r_delta)
 
             c_delta = delta.get("content")
@@ -548,6 +632,7 @@ class StrataAdapter:
                 r_inline, c_clean = think_splitter.feed(c_delta)
                 if r_inline:
                     reasoning_parts.append(r_inline)
+                    r_chars_live += len(r_inline)
                     self.events.emit(EventType.THINKING_DELTA, r_inline)
                 if c_clean:
                     content_parts.append(c_clean)
@@ -570,6 +655,25 @@ class StrataAdapter:
                         tool_calls_map[idx]["function"]["name"] += fn_delta["name"]
                     if fn_delta.get("arguments"):
                         tool_calls_map[idx]["function"]["arguments"] += fn_delta["arguments"]
+
+            if (
+                thought_watchdog_max_chars > 0
+                and not content_parts
+                and not tool_calls_map
+                and r_chars_live >= thought_watchdog_max_chars
+            ):
+                finish_reason = "thought_watchdog"
+                self.events.emit(
+                    EventType.LOG,
+                    f"[WATCHDOG] Reasoning reached {r_chars_live:,} chars (limit {thought_watchdog_max_chars:,}) "
+                    "with 0 output and 0 tool calls; interrupting stream cleanly to redirect model.",
+                    level="warning",
+                )
+                try:
+                    resp.close()
+                except Exception:
+                    pass
+                break
 
             now = time.time()
             if now - last_heartbeat >= 20.0:
@@ -614,6 +718,7 @@ class StrataAdapter:
         tools_schema: Optional[List[Dict[str, Any]]] = None,
         stream: bool = True,
         stop_event: Optional[threading.Event] = None,
+        allow_thought_watchdog: bool = True,
     ) -> ChatCompletionResult:
         include_stream_options = stream
         retries_used = 0
@@ -674,8 +779,16 @@ class StrataAdapter:
                     ctype = (resp.headers.get("Content-Type") or "").lower()
 
                     if stream and "text/event-stream" in ctype:
+                        wd_limit = (
+                            int(getattr(self.config, "thought_watchdog_max_chars", 0))
+                            if (allow_thought_watchdog and getattr(self.config, "thought_watchdog_enabled", False))
+                            else 0
+                        )
                         msg, finish_reason, usage, timings, stopped = self._consume_sse_stream(
-                            resp, start_ts, stop_event=stop_event
+                            resp,
+                            start_ts,
+                            stop_event=stop_event,
+                            thought_watchdog_max_chars=wd_limit,
                         )
                     else:
                         data = json.loads(resp.content.decode("utf-8", errors="replace"))
@@ -709,6 +822,7 @@ class StrataAdapter:
                             self.events.emit(EventType.CONTENT_DELTA, raw_content)
 
                 elapsed = time.time() - start_ts
+                wd_fired = finish_reason == "thought_watchdog"
                 return ChatCompletionResult(
                     message=msg,
                     finish_reason=finish_reason,
@@ -717,6 +831,9 @@ class StrataAdapter:
                     elapsed_s=elapsed,
                     retries_used=retries_used,
                     was_stopped=stopped,
+                    watchdog_triggered=wd_fired,
+                    watchdog_reason="Reasoning exceeded watchdog limit without output/tool call" if wd_fired else None,
+                    engine_state=ENGINE_READY,
                 )
 
             except (
@@ -730,10 +847,31 @@ class StrataAdapter:
                 last_err = err
                 retries_used += 1
                 safe_err = _sanitize_error(err, self.config.api_key)
+                err_body = ""
+                if isinstance(err, requests.exceptions.HTTPError) and err.response is not None:
+                    try:
+                        err_body = err.response.content[:400].decode("utf-8", errors="replace").lower()
+                    except Exception:
+                        err_body = ""
+                if any(m in safe_err.lower() or m in err_body for m in _TERMINATED_MARKERS):
+                    self.events.emit(
+                        EventType.ERROR,
+                        f"[ADAPTER FATAL] Engine state={ENGINE_TERMINATED}: {safe_err}",
+                        level="error",
+                    )
+                    raise EngineTerminatedError(f"Inference engine terminated ({ENGINE_TERMINATED}): {safe_err}") from err
+                eng_state, eng_detail = self.probe_engine_state()
+                if eng_state == ENGINE_TERMINATED:
+                    self.events.emit(
+                        EventType.ERROR,
+                        f"[ADAPTER FATAL] Engine state={ENGINE_TERMINATED}: {eng_detail}",
+                        level="error",
+                    )
+                    raise EngineTerminatedError(f"Inference engine terminated ({ENGINE_TERMINATED}): {eng_detail}") from err
                 self.events.emit(
                     EventType.LOG,
                     f"[ADAPTER WARNING] Request failed after {elapsed:.1f}s "
-                    f"(Attempt {attempt}/{self.config.max_api_retries}): {safe_err}",
+                    f"(Attempt {attempt}/{self.config.max_api_retries}, engine_state={eng_state}): {safe_err}",
                     level="warning",
                 )
                 if attempt < self.config.max_api_retries:

@@ -8,13 +8,22 @@ from __future__ import annotations
 
 import copy
 import json
+import re
 import threading
 import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from lapo.adapters.strata_adapter import StrataAdapter
+from lapo.adapters.strata_adapter import (
+    ENGINE_TERMINATED,
+    EngineTerminatedError,
+    StrataAdapter,
+)
 from lapo.config import RuntimeConfig, format_token_count
-from lapo.core.compaction_manager import CompactionManager, build_in_stream_compaction_signal
+from lapo.core.compaction_manager import (
+    CompactionManager,
+    build_in_stream_compaction_signal,
+    build_workspace_ast_map,
+)
 from lapo.core.context_manager import ContextManager
 from lapo.core.file_lock_manager import FileLockManager
 from lapo.core.live_request_manager import LiveRequestManager
@@ -352,6 +361,11 @@ class ProjectOrchestrator:
     ) -> List[Dict[str, Any]]:
         active = self.phase_manager.get_active_phase()
         machine_state = self.verification_manager.build_machine_verified_snapshot()
+        if getattr(self.config, "inject_ast_map_on_compaction", True):
+            locked_paths = {d["path"] for d in self.lock_manager.list_locks_dicts() if d.get("path")}
+            ast_map = build_workspace_ast_map(self.config.workspace_dir, locked_paths=locked_paths)
+            if ast_map:
+                machine_state["python_ast_map"] = ast_map
         pending_dicts = [
             r.to_dict() for r in self.live_request_manager.pop_undelivered_for_phase(active.id)
         ]
@@ -385,17 +399,93 @@ class ProjectOrchestrator:
         return msgs
 
     @staticmethod
-    def _sanitize_assistant_message_for_history(raw_msg: Dict[str, Any]) -> Dict[str, Any]:
+    def _sanitize_assistant_message_with_metrics(
+        raw_msg: Dict[str, Any],
+        strip_reasoning: bool = True,
+        compact_file_writes: bool = True,
+        inline_written: Optional[List[str]] = None,
+        is_truncated_empty: bool = False,
+    ) -> Tuple[Dict[str, Any], int]:
+        """
+        Append-only single-pass history hygiene applied ONCE before inserting into history.
+        Preserves earlier turns byte-identically for Strata 0.1.67 Conversation Cache reuse.
+        """
         history_msg = copy.deepcopy(raw_msg)
+        chars_stripped = 0
+
+        if strip_reasoning and history_msg.get("reasoning_content"):
+            chars_stripped += len(str(history_msg.get("reasoning_content") or ""))
+            history_msg.pop("reasoning_content", None)
+
         if history_msg.get("tool_calls"):
             for tc in history_msg["tool_calls"]:
                 fn = tc.get("function") or {}
-                raw_args = fn.get("arguments") or "{}"
+                fn_name = str(fn.get("name") or "")
+                raw_args = str(fn.get("arguments") or "{}")
                 try:
-                    json.loads(raw_args, strict=False)
+                    parsed_args = json.loads(raw_args, strict=False)
                 except Exception:
-                    fn["arguments"] = json.dumps({"_truncated_json_recovered": True})
-        return history_msg
+                    replacement = json.dumps({"_truncated_json_recovered": True})
+                    chars_stripped += max(0, len(raw_args) - len(replacement))
+                    fn["arguments"] = replacement
+                    continue
+
+                if (
+                    compact_file_writes
+                    and fn_name == "write_file"
+                    and isinstance(parsed_args, dict)
+                    and isinstance(parsed_args.get("content"), str)
+                    and len(parsed_args["content"]) > 1200
+                ):
+                    c_body = parsed_args["content"]
+                    path_lbl = str(parsed_args.get("path") or "unknown")
+                    receipt = (
+                        f"[compacted from history: {len(c_body)} chars, "
+                        f"{c_body.count(chr(10)) + 1} lines for {path_lbl}; see tool result]"
+                    )
+                    compact_args = json.dumps({"path": path_lbl, "content": receipt}, ensure_ascii=False)
+                    chars_stripped += max(0, len(raw_args) - len(compact_args))
+                    fn["arguments"] = compact_args
+
+        content_val = history_msg.get("content")
+        if isinstance(content_val, str) and content_val:
+            if compact_file_writes and inline_written:
+                def _compact_inline(match: re.Match) -> str:
+                    nonlocal chars_stripped
+                    fpath = match.group(1)
+                    body = match.group(2)
+                    if len(body) <= 1200:
+                        return match.group(0)
+                    rep = (
+                        f'<file path="{fpath}">[compacted from history: {len(body)} chars, '
+                        f'{body.count(chr(10)) + 1} lines written to disk]</file>'
+                    )
+                    chars_stripped += max(0, len(match.group(0)) - len(rep))
+                    return rep
+                content_val = re.sub(
+                    r'<file\s+path=["\']([^"\']+)["\']\s*>(.*?)</file>',
+                    _compact_inline,
+                    content_val,
+                    flags=re.DOTALL,
+                )
+                history_msg["content"] = content_val
+
+            if is_truncated_empty and len(content_val) > 1200:
+                short_notice = (
+                    f"[truncated response omitted from history ({len(content_val)} chars; finish_reason=length). "
+                    "Emit concise tool calls or one file per turn.]"
+                )
+                chars_stripped += max(0, len(content_val) - len(short_notice))
+                history_msg["content"] = short_notice
+
+        return history_msg, chars_stripped
+
+    @staticmethod
+    def _sanitize_assistant_message_for_history(raw_msg: Dict[str, Any]) -> Dict[str, Any]:
+        msg, _ = ProjectOrchestrator._sanitize_assistant_message_with_metrics(
+            raw_msg, strip_reasoning=True, compact_file_writes=True
+        )
+        return msg
 
     def _inject_live_requests_if_any(self, messages: List[Dict[str, Any]]) -> None:
         active = self.phase_manager.get_active_phase()
@@ -491,6 +581,8 @@ class ProjectOrchestrator:
                 self.verification_manager.bootstrap_workspace_dependencies()
 
             inspection = self.adapter.inspect_server()
+            if inspection.engine_state == ENGINE_TERMINATED:
+                raise EngineTerminatedError(f"Inference engine is {ENGINE_TERMINATED}: {inspection.error}")
             if not inspection.reachable:
                 raise RuntimeError(f"Inference server unreachable at {self.config.api_base_url}: {inspection.error}")
 
@@ -500,7 +592,18 @@ class ProjectOrchestrator:
                 raise RuntimeError("No target model selected and server returned no active models.")
 
             self.context_manager.update_detected_capacity(inspection.detected_context_tokens)
-            self.usage_ledger.mark_started(detected_ctx=inspection.detected_context_tokens)
+            strata_metrics_start = self.adapter.fetch_strata_metrics()
+            self.usage_ledger.mark_started(
+                detected_ctx=inspection.detected_context_tokens,
+                engine_version=inspection.engine_version,
+                strata_metrics_snapshot=strata_metrics_start,
+            )
+            self.events.emit(
+                EventType.LOG,
+                f"[ENGINE] Version: {inspection.engine_version or 'unknown'} | "
+                f"State: {inspection.engine_state} | Detected Context: {inspection.detected_context_tokens}",
+                level="info",
+            )
 
             self._system_prompt = self.phase_manager.build_system_prompt(self.config.tool_protocol)
 
@@ -541,6 +644,7 @@ class ProjectOrchestrator:
             awaiting_compaction = False
             compaction_prev_tokens = 0
             consecutive_json_errors = 0
+            consecutive_watchdog_hits = 0
             turns = 0
 
             while not self._stop_event.is_set() and not self._project_finished and turns < max_turns:
@@ -587,6 +691,7 @@ class ProjectOrchestrator:
                     tools_schema=TOOLS_SCHEMA,
                     stream=True,
                     stop_event=self._stop_event,
+                    allow_thought_watchdog=not awaiting_compaction,
                 )
 
                 if result.was_stopped:
@@ -637,6 +742,35 @@ class ProjectOrchestrator:
                     )
                     continue
 
+                if result.watchdog_triggered:
+                    consecutive_watchdog_hits += 1
+                    self.usage_ledger.record_watchdog_trigger()
+                    stripped_r = len(reasoning_str)
+                    if stripped_r > 0:
+                        self.usage_ledger.record_history_compaction_savings(stripped_r)
+                    self.context_manager.last_engine_tokens = est_tokens
+                    self._messages.append(
+                        {
+                            "role": "assistant",
+                            "content": "[Thought watchdog interrupted overlong reasoning before any output or tool call.]",
+                        }
+                    )
+                    urgency = f"CRITICAL (watchdog #{consecutive_watchdog_hits}): " if consecutive_watchdog_hits >= 2 else ""
+                    self._messages.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                f"[ORCHESTRATOR WATCHDOG] {urgency}Your previous turn spent {stripped_r:,} chars "
+                                "in reasoning without producing output or a tool call. Do NOT draft full code "
+                                "inside <think>. Keep reasoning to a brief 5-line outline and immediately emit "
+                                'the file via <file path="relative/path.ext">...</file> or call a tool now.'
+                            ),
+                        }
+                    )
+                    self.recovery_manager.save_journal(self._messages)
+                    continue
+                consecutive_watchdog_hits = 0
+
                 inline_written, inline_errors = self.tools.extract_and_write_inline_files(content_str)
                 if inline_written:
                     self.usage_ledger.record_inline_files(len(inline_written))
@@ -647,7 +781,21 @@ class ProjectOrchestrator:
                 if not native_tool_calls and self.config.tool_protocol in ("text", "auto"):
                     text_tool_calls = extract_text_tool_calls(content_str)
 
-                history_msg = self._sanitize_assistant_message_for_history(raw_msg)
+                is_truncated_empty = (
+                    result.finish_reason == "length"
+                    and not inline_written
+                    and not native_tool_calls
+                    and not text_tool_calls
+                )
+                history_msg, chars_stripped = self._sanitize_assistant_message_with_metrics(
+                    raw_msg,
+                    strip_reasoning=getattr(self.config, "strip_history_reasoning", True),
+                    compact_file_writes=getattr(self.config, "compact_history_file_writes", True),
+                    inline_written=inline_written,
+                    is_truncated_empty=is_truncated_empty,
+                )
+                if chars_stripped > 0:
+                    self.usage_ledger.record_history_compaction_savings(chars_stripped)
                 self._messages.append(history_msg)
                 self.recovery_manager.save_journal(self._messages)
 
@@ -777,12 +925,25 @@ class ProjectOrchestrator:
                             }
                         )
 
+                effective_post_tokens = post_tokens
+                if chars_stripped > 0:
+                    turn_comp_tok = int(
+                        (result.usage or {}).get("completion_tokens")
+                        or (result.timings or {}).get("predicted_n")
+                        or 0
+                    )
+                    est_saved = int(chars_stripped / 3.5)
+                    if turn_comp_tok > 0:
+                        est_saved = min(est_saved, max(0, turn_comp_tok - 64))
+                    effective_post_tokens = max(est_tokens, post_tokens - est_saved)
+                    self.context_manager.last_engine_tokens = effective_post_tokens
+
                 if not awaiting_compaction and self.context_manager.should_trigger_compaction(
-                    post_tokens, wrote_or_tested=wrote_or_tested
+                    effective_post_tokens, wrote_or_tested=wrote_or_tested
                 ):
-                    self._arm_in_stream_compaction(post_tokens, origin="POST-FLIGHT")
+                    self._arm_in_stream_compaction(effective_post_tokens, origin="POST-FLIGHT")
                     awaiting_compaction = True
-                    compaction_prev_tokens = post_tokens
+                    compaction_prev_tokens = effective_post_tokens
 
                 self.recovery_manager.save_journal(self._messages)
 
@@ -793,6 +954,7 @@ class ProjectOrchestrator:
                     level="warning",
                 )
 
+            self.usage_ledger.record_strata_metrics_end(self.adapter.fetch_strata_metrics())
             assert self.phase_manager.plan is not None
             json_path, md_path, report_obj, md_text = self.usage_ledger.generate_final_reports(
                 plan=self.phase_manager.plan,

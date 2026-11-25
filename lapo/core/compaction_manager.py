@@ -7,9 +7,12 @@ atomically saves state, and rebuilds a fresh session on the EXACT active phase.
 
 from __future__ import annotations
 
+import ast
 import json
+import os
 import re
-from typing import Any, Dict, List, Optional, Tuple
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from jsonschema import ValidationError, validate
 
@@ -57,6 +60,141 @@ CONTINUATION_REPORT_SCHEMA: Dict[str, Any] = {
 }
 
 
+def _compact_ast_args(args_node: ast.arguments) -> str:
+    parts: List[str] = []
+    for a in getattr(args_node, "posonlyargs", []):
+        parts.append(a.arg)
+    for a in args_node.args:
+        parts.append(a.arg)
+    if args_node.vararg:
+        parts.append("*" + args_node.vararg.arg)
+    for a in args_node.kwonlyargs:
+        parts.append(a.arg)
+    if args_node.kwarg:
+        parts.append("**" + args_node.kwarg.arg)
+    return ", ".join(parts[:8]) + (", ..." if len(parts) > 8 else "")
+def build_workspace_ast_map(
+    workspace_root: Path,
+    locked_paths: Optional[Set[str]] = None,
+    max_chars: int = 4500,
+) -> Dict[str, Any]:
+    """Build a compact AST symbol map of Python workspace files to prevent post-compaction re-reads."""
+    locked_set = locked_paths or set()
+    ignored = {"node_modules", ".git", ".orchestrator", "__pycache__", ".venv", "venv", "dist", "build"}
+    result: Dict[str, Any] = {}
+    used_chars = 2
+    if not workspace_root.exists():
+        return result
+    py_files: List[Path] = []
+    for r_dir, dnames, fnames in os.walk(workspace_root):
+        dnames[:] = [d for d in sorted(dnames) if d not in ignored]
+        for fn in sorted(fnames):
+            if fn.endswith(".py"):
+                py_files.append(Path(r_dir) / fn)
+    for fp in py_files:
+        try:
+            rel = fp.resolve().relative_to(workspace_root.resolve()).as_posix()
+            text = fp.read_text(encoding="utf-8", errors="replace")
+            tree = ast.parse(text)
+        except Exception:
+            continue
+        symbols: List[str] = []
+        for node in tree.body:
+            if isinstance(node, ast.ClassDef):
+                methods = [
+                    f"{n.name}({_compact_ast_args(n.args)})"
+                    for n in node.body
+                    if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+                ]
+                m_str = ", ".join(methods[:12]) + (f" (+{len(methods) - 12} more)" if len(methods) > 12 else "")
+                symbols.append(f"class {node.name}: {m_str}" if m_str else f"class {node.name}")
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                symbols.append(f"def {node.name}({_compact_ast_args(node.args)})")
+            elif isinstance(node, ast.Assign):
+                for tgt in node.targets:
+                    if isinstance(tgt, ast.Name) and (tgt.id == "__all__" or tgt.id.isupper()):
+                        symbols.append(f"const {tgt.id}")
+                        break
+        entry = {
+            "lines": text.count("\n") + 1,
+            "bytes": fp.stat().st_size,
+            "locked": rel in locked_set,
+            "symbols": symbols[:24],
+        }
+        entry_len = len(json.dumps({rel: entry}, ensure_ascii=False))
+        if used_chars + entry_len > max_chars and result:
+            result["_truncated"] = True
+            break
+        result[rel] = entry
+        used_chars += entry_len
+    return result
+def enforce_continuation_report_budget(
+    report: Dict[str, Any],
+    max_chars: int = 4000,
+) -> Tuple[Dict[str, Any], bool]:
+    """Strictly bound continuation JSON size so post-reset context never bloats."""
+    serialized = json.dumps(report, ensure_ascii=False)
+    if len(serialized) <= max_chars:
+        return report, False
+    bounded = dict(report)
+    array_keys = (
+        "design_decisions_locked",
+        "active_assumptions",
+        "completed_work",
+        "files_created_or_modified",
+        "unfinished_work",
+        "known_failures_and_blockers",
+    )
+    for item_cap, list_cap, str_cap in (
+        (260, 12, 320),
+        (160, 8, 260),
+        (110, 5, 220),
+        (80, 4, 180),
+        (60, 3, 140),
+        (45, 2, 110),
+    ):
+        for key in array_keys:
+            vals = bounded.get(key)
+            if isinstance(vals, list):
+                bounded[key] = [
+                    (str(v)[: item_cap - 3] + "...") if len(str(v)) > item_cap else str(v)
+                    for v in vals[:list_cap]
+                ]
+        for str_key in ("current_objective", "next_exact_action"):
+            val = str(bounded.get(str_key) or "")
+            if len(val) > str_cap:
+                bounded[str_key] = val[: str_cap - 3] + "..."
+        if len(json.dumps(bounded, ensure_ascii=False)) <= max_chars:
+            return bounded, True
+    # Deterministic fallback: pop tail items from least-critical lists first until <= max_chars
+    prune_order = (
+        "active_assumptions",
+        "completed_work",
+        "design_decisions_locked",
+        "known_failures_and_blockers",
+        "files_created_or_modified",
+        "unfinished_work",
+    )
+    while len(json.dumps(bounded, ensure_ascii=False)) > max_chars:
+        progressed = False
+        for key in prune_order:
+            vals = bounded.get(key)
+            if isinstance(vals, list) and vals:
+                vals.pop()
+                progressed = True
+                if len(json.dumps(bounded, ensure_ascii=False)) <= max_chars:
+                    return bounded, True
+        if not progressed:
+            for str_key in ("current_objective", "next_exact_action"):
+                val = str(bounded.get(str_key) or "")
+                if len(val) > 24:
+                    bounded[str_key] = val[: max(20, len(val) // 2)] + "..."
+                    progressed = True
+                    if len(json.dumps(bounded, ensure_ascii=False)) <= max_chars:
+                        return bounded, True
+        if not progressed:
+            break
+    return bounded, True
 def build_in_stream_compaction_signal(
     active_phase: PhaseDefinition,
     active_tokens: int,
@@ -70,7 +208,8 @@ def build_in_stream_compaction_signal(
         f"Context compaction does NOT change your active phase. You remain strictly in "
         f"Phase {active_phase.id}: '{active_phase.name}'.\n\n"
         "1. Do NOT call any tools and do NOT output any `<file>` blocks in your next response.\n"
-        "2. Synthesize everything learned and decided so far, then output ONLY a valid raw JSON object "
+        "2. Keep the JSON CONCISE (strictly under 3,500 chars total; do NOT paste source code or test fixtures — "
+        "LAPO automatically attaches an AST symbol map of workspace files after reset). Output ONLY a valid raw JSON object "
         "(no markdown code fences) matching this exact structure:\n"
         "{\n"
         f'  "current_objective": "Goal for Phase {active_phase.id}",\n'
@@ -88,7 +227,7 @@ def build_in_stream_compaction_signal(
     )
 
 
-def parse_continuation_report(raw_text: Optional[str], active_phase: PhaseDefinition) -> Dict[str, Any]:
+def parse_continuation_report(raw_text: Optional[str], active_phase: PhaseDefinition, max_chars: int = 0) -> Dict[str, Any]:
     text = raw_text or ""
     cleaned = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
     cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
@@ -127,6 +266,8 @@ def parse_continuation_report(raw_text: Optional[str], active_phase: PhaseDefini
     parsed.setdefault("next_exact_action", f"Continue unfinished work in Phase {active_phase.id}: {active_phase.name}")
 
     validate(instance=parsed, schema=CONTINUATION_REPORT_SCHEMA)
+    if max_chars and max_chars > 0:
+        parsed, _ = enforce_continuation_report_budget(parsed, max_chars=max_chars)
     return parsed
 
 
@@ -211,9 +352,16 @@ class CompactionManager:
             assert plan is not None
 
             machine_state = self.verification_manager.build_machine_verified_snapshot()
+            cfg = getattr(self.phase_manager, "config", None)
+            summary_budget = int(getattr(cfg, "max_compaction_summary_chars", 4000)) if cfg else 4000
+            if cfg and getattr(cfg, "inject_ast_map_on_compaction", True):
+                locked_paths = {d["path"] for d in self.lock_manager.list_locks_dicts() if d.get("path")}
+                ast_map = build_workspace_ast_map(cfg.workspace_dir, locked_paths=locked_paths)
+                if ast_map:
+                    machine_state["python_ast_map"] = ast_map
 
             try:
-                report = parse_continuation_report(raw_model_output, active_phase)
+                report = parse_continuation_report(raw_model_output, active_phase, max_chars=summary_budget)
             except (json.JSONDecodeError, ValidationError, ValueError, Exception) as err:
                 used_fallback = True
                 self.events.emit(

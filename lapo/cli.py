@@ -18,6 +18,7 @@ from lapo.config import (
     DEFAULT_API_BASE_URL,
     DEFAULT_API_KEY,
     SUPPORTED_TOOL_PROTOCOLS,
+    STRATA_HOTROD_PROFILES,
     RuntimeConfig,
 )
 from lapo.core.file_lock_manager import FileLockManager
@@ -123,6 +124,16 @@ def _load_config_from_args(args: argparse.Namespace) -> Tuple[RuntimeConfig, Opt
         else:
             raise RuntimeError(f"Invalid phases JSON file: {p_path}")
 
+    profile_name = getattr(args, "profile", None)
+    if profile_name:
+        prof = STRATA_HOTROD_PROFILES.get(profile_name)
+        if not prof:
+            raise RuntimeError(f"Unknown HotRod profile: {profile_name}")
+        file_data["context_setting"] = prof["context_setting"]
+        file_data["max_gen_tokens"] = prof["max_gen_tokens"]
+        file_data["thought_watchdog_enabled"] = True
+        file_data["thought_watchdog_max_chars"] = prof["thought_watchdog_max_chars"]
+
     if getattr(args, "workspace", None):
         file_data["workspace_dir"] = args.workspace
     if getattr(args, "skills", None):
@@ -151,6 +162,20 @@ def _load_config_from_args(args: argparse.Namespace) -> Tuple[RuntimeConfig, Opt
         file_data["route_api_via_proxy"] = True
     if getattr(args, "no_auto_install_deps", False):
         file_data["auto_install_deps"] = False
+    if getattr(args, "thought_watchdog_max_chars", None) is not None:
+        file_data["thought_watchdog_max_chars"] = args.thought_watchdog_max_chars
+    if getattr(args, "no_thought_watchdog", False):
+        file_data["thought_watchdog_enabled"] = False
+    if getattr(args, "keep_history_reasoning", False):
+        file_data["strip_history_reasoning"] = False
+    if getattr(args, "no_compact_writes", False):
+        file_data["compact_history_file_writes"] = False
+    if getattr(args, "max_compaction_summary_chars", None) is not None:
+        file_data["max_compaction_summary_chars"] = args.max_compaction_summary_chars
+    if getattr(args, "no_ast_map", False):
+        file_data["inject_ast_map_on_compaction"] = False
+    if getattr(args, "no_strata_telemetry", False):
+        file_data["strata_telemetry_enabled"] = False
 
     cfg = RuntimeConfig.from_dict(file_data)
     return cfg, phases
@@ -176,6 +201,23 @@ def cmd_models(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_profiles(args: argparse.Namespace) -> int:
+    if getattr(args, "json", False):
+        print(json.dumps(STRATA_HOTROD_PROFILES, indent=2, ensure_ascii=False))
+        return 0
+    print(f"LAPO v{__version__} Verified Strata-HotRod Profiles:")
+    for key, prof in STRATA_HOTROD_PROFILES.items():
+        flags = " ".join(prof.get("strata_flags") or [])
+        print(f"  - {key}: {prof['label']}")
+        print(
+            f"      context={prof['context_setting']} | max_gen={prof['max_gen_tokens']} | "
+            f"watchdog_chars={prof['thought_watchdog_max_chars']} | engine={prof.get('recommended_engine', '0.1.67')}"
+        )
+        if flags:
+            print(f"      strata: {flags}")
+    return 0
+
+
 def cmd_init_config(args: argparse.Namespace) -> int:
     target_dir = Path(args.directory).expanduser().resolve()
     target_dir.mkdir(parents=True, exist_ok=True)
@@ -188,6 +230,13 @@ def cmd_init_config(args: argparse.Namespace) -> int:
         "context_setting": "auto",
         "compaction_threshold_pct": 0.75,
         "max_gen_tokens": 32768,
+        "strip_history_reasoning": True,
+        "compact_history_file_writes": True,
+        "thought_watchdog_enabled": True,
+        "thought_watchdog_max_chars": 32000,
+        "max_compaction_summary_chars": 4000,
+        "inject_ast_map_on_compaction": True,
+        "strata_telemetry_enabled": True,
         "unattended_auto_verify": True,
         "tool_protocol": "auto",
         "allowed_commands": [],
@@ -317,6 +366,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_models.add_argument("--url", default=DEFAULT_API_BASE_URL, help="API Base URL (e.g. http://127.0.0.1:5678/v1)")
     p_models.add_argument("--api-key", default=DEFAULT_API_KEY)
 
+    p_profiles = sub.add_parser("profiles", help="List verified Strata-HotRod performance profiles.")
+    p_profiles.add_argument("--json", action="store_true", help="Output profiles as JSON")
+
     p_init = sub.add_parser("init-config", help="Generate a starter project.json template.")
     p_init.add_argument("--directory", required=True, help="Target directory for project.json")
 
@@ -344,6 +396,22 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--context", help="Context ceiling: auto, 32K, 128K, 256K, 512K, 1M, or integer")
         p.add_argument("--compaction-pct", type=float, help="Compaction threshold ratio (e.g. 0.75)")
         p.add_argument("--max-gen-tokens", type=int, help="Max generation tokens per turn")
+        p.add_argument(
+            "--profile",
+            choices=sorted(STRATA_HOTROD_PROFILES.keys()),
+            help="Apply a verified Strata-HotRod profile (explicit CLI flags override profile defaults)",
+        )
+        p.add_argument(
+            "--thought-watchdog-max-chars",
+            type=int,
+            help="Interrupt runaway reasoning after N chars if 0 output & 0 tool calls (default: 32000)",
+        )
+        p.add_argument("--no-thought-watchdog", action="store_true", help="Disable live thought watchdog")
+        p.add_argument("--keep-history-reasoning", action="store_true", help="Keep reasoning_content in history")
+        p.add_argument("--no-compact-writes", action="store_true", help="Keep full write_file/<file> bodies in history")
+        p.add_argument("--max-compaction-summary-chars", type=int, help="Hard char cap for compaction summary JSON")
+        p.add_argument("--no-ast-map", action="store_true", help="Disable Python AST symbol map injection")
+        p.add_argument("--no-strata-telemetry", action="store_true", help="Disable Strata /metrics polling")
         p.add_argument("--tool-protocol", choices=SUPPORTED_TOOL_PROTOCOLS, help="Tool protocol mode")
         p.add_argument(
             "--manual-approval",
@@ -383,6 +451,8 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if args.command == "models":
         return cmd_models(args)
+    if args.command == "profiles":
+        return cmd_profiles(args)
     if args.command == "init-config":
         return cmd_init_config(args)
     if args.command == "status":

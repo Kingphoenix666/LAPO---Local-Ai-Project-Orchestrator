@@ -165,6 +165,22 @@ class FileLockManager:
 
         return True, "ok"
 
+    def check_delete_permission(self, rel_posix: str) -> Tuple[bool, str]:
+        """Allow deleting only unlocked workspace files outside the repair queue."""
+        if rel_posix in self._locks:
+            entry = self._locks[rel_posix]
+            return (
+                False,
+                f"LOCKED FILE REJECTION: '{rel_posix}' was finalized in Phase {entry.owner_phase_id} "
+                f"(sha256:{entry.sha256[:12]}). Locked files cannot be deleted.",
+            )
+        if rel_posix in self._repair_queue:
+            return (
+                False,
+                f"REPAIR PROTOCOL: '{rel_posix}' is unlocked for controlled repair and cannot be deleted.",
+            )
+        return True, "ok"
+
     # ------------------------------------------------------------------
     # Candidate Registration & Phase Lock Commits
     # ------------------------------------------------------------------

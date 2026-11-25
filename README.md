@@ -4,11 +4,11 @@
 
 **Turn local LLMs (Strata, llama.cpp, LM Studio, vLLM) into reliable, unattended, multi-phase engineering agents.**
 
-[![Version](https://img.shields.io/badge/Version-1.0.3-2f81f7?style=flat-square)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/Version-1.1.0-2f81f7?style=flat-square)](CHANGELOG.md)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-3776ab?style=flat-square&logo=python&logoColor=white)](pyproject.toml)
 [![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux-2ea043?style=flat-square)](#quick-start)
 [![Interfaces](https://img.shields.io/badge/Interface-Desktop%20GUI%20%2B%20CLI-d29922?style=flat-square)](#quick-start)
-[![Tests](https://img.shields.io/badge/Automated%20Tests-31%20Passed-238636?style=flat-square)](tests/)
+[![Tests](https://img.shields.io/badge/Automated%20Tests-39%20Passed-238636?style=flat-square)](tests/)
 
 <br>
 
@@ -68,6 +68,18 @@ Both the **Desktop GUI (`Tkinter`/`ttk`)** and the **Headless Terminal CLI (`lap
 
 ---
 
+## What's New in v1.1.0 (HotRod & Strata 0.1.67)
+- **Strata Engine `0.1.67` Native Telemetry & Lifecycle Guard:** Auto-detects engine version and `cache_max_tokens` via `/v1/status`, captures `/metrics` deltas (`prompt_tokens_read` vs `prompt_tokens_reused`, `DFlash2`/`MTP` acceptance rate), and handles `ENGINE_TERMINATED` cleanly.
+- **Cache-Safe Append-Only History Hygiene:** Strips reasoning blocks and compacts large file writes into one-line receipts once per turn without mutating earlier turns—preserving Strata `0.1.67` Conversation Cache prefix hits.
+- **Live Thought Watchdog + Anti-Drafting Policy:** Interrupts runaway reasoning streams that emit no output/tool calls and redirects the model cleanly.
+- **Bounded Compaction JSON + Python AST Symbol Map:** Caps continuation JSON size (`4,000` chars default) and attaches a compact `python_ast_map` after context resets to prevent redundant full-file re-reads.
+- **Lock-Aware `delete_file` Tool & HotRod Profiles:** Safe scratch-file cleanup with automatic backup, plus ready-to-use `--profile` presets (`gyro_m_256k_native`, `gyro_m_512k`, `coder_iq1_m_128k`, `coder_iq1_m_64k`) in both CLI (`lapo profiles`) and Desktop GUI.
+### Verified Strata Engine Benchmarks (RTX 4070 12GB · Windows 11)
+| Run / Profile | Engine | Phases & Outcome | Prompt Reuse | Draft Accept | Compactions | Unit Tests |
+| :--- | :--- | :--- | :---: | :---: | :---: | :---: |
+| **LAPO v1.1.0 Live Check (`gyro_m_256k_native`)** | `0.1.67` | 2 phases · `exit 0` (23 reqs, 0 err, 19.9K chars compacted) | **88.83%** | **83.4%** (`DFlash2`) | **0** | **100% OK** |
+| **Baseline Reference (`Gyro-M 512K`, `mini_kv`)** | `0.1.64` | 3 phases · `exit 0` (110 reqs, 156 min) | **98.83%** | **84.43%** (`DFlash2`) | **0** | **199 / 199 OK** |
+| **Ablation Study (`Coder IQ1_M 64K`, `mini_kv`)** | `0.1.66` | 2 phases · `exit 0` (86 reqs, 133.6 min) | **85.28%** | **75.19%** (`MTP`) | 6 | **108 / 108 OK** |
 ## Quick Start
 
 ### Windows

@@ -19,6 +19,7 @@ from lapo.config import (
     DEFAULT_API_BASE_URL,
     DEFAULT_API_KEY,
     SUPPORTED_TOOL_PROTOCOLS,
+    STRATA_HOTROD_PROFILES,
     RuntimeConfig,
     normalize_proxy_url,
     probe_proxy_tcp,
@@ -93,6 +94,12 @@ class LapoMainWindow:
         self.var_tool_protocol = tk.StringVar(value="auto")
         self.var_unattended_auto_verify = tk.BooleanVar(value=True)
         self.var_auto_install_deps = tk.BooleanVar(value=True)
+        self.var_profile = tk.StringVar(value="custom")
+        self.var_thought_watchdog = tk.BooleanVar(value=True)
+        self.var_watchdog_chars = tk.StringVar(value="32000")
+        self.var_strip_reasoning = tk.BooleanVar(value=True)
+        self.var_compact_writes = tk.BooleanVar(value=True)
+        self.var_inject_ast_map = tk.BooleanVar(value=True)
 
         self.var_live_phase = tk.StringVar(value="active")
         self.var_status = tk.StringVar(value="Status: Ready")
@@ -196,7 +203,7 @@ class LapoMainWindow:
         ).pack(side="left", padx=(3, 0))
 
         p3 = ttk.Frame(f_paths, style="Panel.TFrame")
-        p3.pack(fill="x")
+        p3.pack(fill="x", pady=(0, 4))
         ttk.Checkbutton(
             p3,
             text="Auto-Verify (Unattended)",
@@ -206,6 +213,35 @@ class LapoMainWindow:
             p3,
             text="Auto-Install Deps (npm via Proxy on Start)",
             variable=self.var_auto_install_deps,
+        ).pack(side="left")
+
+        p4 = ttk.Frame(f_paths, style="Panel.TFrame")
+        p4.pack(fill="x")
+        ttk.Label(p4, text="HotRod:").pack(side="left")
+        self.combo_profile = ttk.Combobox(
+            p4,
+            textvariable=self.var_profile,
+            values=["custom"] + sorted(STRATA_HOTROD_PROFILES.keys()),
+            state="readonly",
+            width=18,
+        )
+        self.combo_profile.pack(side="left", padx=(3, 8))
+        self.combo_profile.bind("<<ComboboxSelected>>", self._on_profile_selected)
+        ttk.Checkbutton(
+            p4,
+            text="Watchdog:",
+            variable=self.var_thought_watchdog,
+        ).pack(side="left")
+        ttk.Entry(p4, textvariable=self.var_watchdog_chars, width=6).pack(side="left", padx=(2, 8))
+        ttk.Checkbutton(
+            p4,
+            text="History Hygiene",
+            variable=self.var_strip_reasoning,
+        ).pack(side="left", padx=(0, 6))
+        ttk.Checkbutton(
+            p4,
+            text="AST Map",
+            variable=self.var_inject_ast_map,
         ).pack(side="left")
 
         # 3. Persistent Footer Execution Controls — packed BEFORE `paned` so it is NEVER clipped!
@@ -351,6 +387,26 @@ class LapoMainWindow:
         if self.var_live_phase.get() not in values:
             self.var_live_phase.set("active")
 
+    def _on_profile_selected(self, _event: object = None) -> None:
+        key = self.var_profile.get().strip()
+        prof = STRATA_HOTROD_PROFILES.get(key)
+        if not prof:
+            return
+        ctx_val = int(prof["context_setting"])
+        ctx_label = f"{ctx_val // 1024}K" if (ctx_val % 1024 == 0 and ctx_val >= 1024) else str(ctx_val)
+        self.var_context.set(ctx_label)
+        self.var_max_gen.set(str(prof["max_gen_tokens"]))
+        self.var_thought_watchdog.set(True)
+        self.var_watchdog_chars.set(str(prof["thought_watchdog_max_chars"]))
+        self.var_strip_reasoning.set(True)
+        self.var_compact_writes.set(True)
+        self.var_inject_ast_map.set(True)
+        self.monitor.append_activity(
+            f"[PROFILE] Applied '{key}' ({prof['label']}): context={ctx_label}, "
+            f"max_gen={prof['max_gen_tokens']}, watchdog={prof['thought_watchdog_max_chars']} chars.",
+            "info",
+        )
+
     def _build_runtime_config(self, require_model: bool = True) -> RuntimeConfig:
         ws = self.var_workspace.get().strip()
         if not ws:
@@ -386,6 +442,11 @@ class LapoMainWindow:
             context_setting=self.var_context.get().strip() or "auto",
             compaction_threshold_pct=pct_val,
             max_gen_tokens=int(self.var_max_gen.get().strip() or "32768"),
+            strip_history_reasoning=bool(self.var_strip_reasoning.get()),
+            compact_history_file_writes=bool(self.var_compact_writes.get()),
+            thought_watchdog_enabled=bool(self.var_thought_watchdog.get()),
+            thought_watchdog_max_chars=max(0, int(self.var_watchdog_chars.get().strip() or "32000")),
+            inject_ast_map_on_compaction=bool(self.var_inject_ast_map.get()),
             unattended_auto_verify=bool(self.var_unattended_auto_verify.get()),
             auto_install_deps=bool(self.var_auto_install_deps.get()),
             read_timeout_s=int(self.var_read_timeout.get().strip() or "5400"),
@@ -472,6 +533,17 @@ class LapoMainWindow:
             self.var_compaction_pct.set(str(int(pct * 100) if pct <= 1.0 else int(pct)))
         if data.get("max_gen_tokens") is not None:
             self.var_max_gen.set(str(data["max_gen_tokens"]))
+        if data.get("strip_history_reasoning") is not None:
+            self.var_strip_reasoning.set(bool(data["strip_history_reasoning"]))
+        if data.get("compact_history_file_writes") is not None:
+            self.var_compact_writes.set(bool(data["compact_history_file_writes"]))
+        if data.get("thought_watchdog_enabled") is not None:
+            self.var_thought_watchdog.set(bool(data["thought_watchdog_enabled"]))
+        if data.get("thought_watchdog_max_chars") is not None:
+            self.var_watchdog_chars.set(str(data["thought_watchdog_max_chars"]))
+        if data.get("inject_ast_map_on_compaction") is not None:
+            self.var_inject_ast_map.set(bool(data["inject_ast_map_on_compaction"]))
+        self.var_profile.set("custom")
         if data.get("unattended_auto_verify") is not None:
             self.var_unattended_auto_verify.set(bool(data["unattended_auto_verify"]))
         if data.get("auto_install_deps") is not None:

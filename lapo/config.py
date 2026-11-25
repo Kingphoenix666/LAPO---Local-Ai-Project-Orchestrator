@@ -146,6 +146,40 @@ def resolve_active_proxy(
     return None, "unreachable_direct"
 
 
+STRATA_HOTROD_PROFILES: Dict[str, Dict[str, Any]] = {
+    "gyro_m_256k_native": {
+        "label": "Heavy / Architect (Gyro-M 256K Native int8)",
+        "context_setting": 262144,
+        "max_gen_tokens": 32768,
+        "thought_watchdog_max_chars": 32000,
+        "recommended_engine": "0.1.67",
+        "strata_flags": ["--max-context", "262144", "--kv", "int8", "--kv-resident", "32768", "--vram-reserve-mib", "1024", "--draft", "dflash2"],
+    },
+    "gyro_m_512k": {
+        "label": "Deep Context (Gyro-M 512K YARN int8)",
+        "context_setting": 524288,
+        "max_gen_tokens": 32768,
+        "thought_watchdog_max_chars": 36000,
+        "recommended_engine": "0.1.67",
+        "strata_flags": ["--max-context", "524288", "--kv", "int8", "--draft", "dflash2"],
+    },
+    "coder_iq1_m_128k": {
+        "label": "Fast Coder (Coder IQ1_M 128K int8 MTP)",
+        "context_setting": 131072,
+        "max_gen_tokens": 32768,
+        "thought_watchdog_max_chars": 24000,
+        "recommended_engine": "0.1.67",
+        "strata_flags": ["--max-context", "131072", "--kv", "int8", "--kv-resident", "32768", "--vram-reserve-mib", "1024", "--draft", "mtp"],
+    },
+    "coder_iq1_m_64k": {
+        "label": "Lightweight Coder (Coder IQ1_M 64K int8 MTP)",
+        "context_setting": 65536,
+        "max_gen_tokens": 32768,
+        "thought_watchdog_max_chars": 20000,
+        "recommended_engine": "0.1.67",
+        "strata_flags": ["--max-context", "65536", "--kv", "int8", "--draft", "mtp"],
+    },
+}
 @dataclass
 class RuntimeConfig:
     """Complete dynamic configuration shared by CLI and Desktop GUI."""
@@ -163,6 +197,15 @@ class RuntimeConfig:
     hard_force_pct: float = 0.85
     max_gen_tokens: int = 32768
     max_tool_output_chars: int = 32000
+
+    # HotRod v1.1.0 history hygiene, watchdog, compaction & telemetry controls
+    strip_history_reasoning: bool = True
+    compact_history_file_writes: bool = True
+    thought_watchdog_enabled: bool = True
+    thought_watchdog_max_chars: int = 32000
+    max_compaction_summary_chars: int = 4000
+    inject_ast_map_on_compaction: bool = True
+    strata_telemetry_enabled: bool = True
 
     # Autonomous execution controls
     unattended_auto_verify: bool = True
@@ -208,6 +251,10 @@ class RuntimeConfig:
             raise ValueError("max_gen_tokens must be at least 512.")
         if self.read_timeout_s < 10:
             raise ValueError("read_timeout_s must be at least 10 seconds.")
+        if self.thought_watchdog_max_chars < 0:
+            raise ValueError("thought_watchdog_max_chars must be >= 0.")
+        if self.max_compaction_summary_chars < 500:
+            raise ValueError("max_compaction_summary_chars must be at least 500.")
 
     @property
     def server_url(self) -> str:
@@ -283,6 +330,13 @@ class RuntimeConfig:
             "min_no_compact_pct": self.min_no_compact_pct,
             "hard_force_pct": self.hard_force_pct,
             "max_gen_tokens": self.max_gen_tokens,
+            "strip_history_reasoning": self.strip_history_reasoning,
+            "compact_history_file_writes": self.compact_history_file_writes,
+            "thought_watchdog_enabled": self.thought_watchdog_enabled,
+            "thought_watchdog_max_chars": self.thought_watchdog_max_chars,
+            "max_compaction_summary_chars": self.max_compaction_summary_chars,
+            "inject_ast_map_on_compaction": self.inject_ast_map_on_compaction,
+            "strata_telemetry_enabled": self.strata_telemetry_enabled,
             "unattended_auto_verify": self.unattended_auto_verify,
             "auto_install_deps": self.auto_install_deps,
             "temperature": self.temperature,
@@ -326,6 +380,13 @@ class RuntimeConfig:
             hard_force_pct=float(data.get("hard_force_pct", 0.85)),
             max_gen_tokens=int(data.get("max_gen_tokens", 32768)),
             max_tool_output_chars=int(data.get("max_tool_output_chars", 32000)),
+            strip_history_reasoning=bool(data.get("strip_history_reasoning", True)),
+            compact_history_file_writes=bool(data.get("compact_history_file_writes", True)),
+            thought_watchdog_enabled=bool(data.get("thought_watchdog_enabled", True)),
+            thought_watchdog_max_chars=int(data.get("thought_watchdog_max_chars", 32000)),
+            max_compaction_summary_chars=int(data.get("max_compaction_summary_chars", 4000)),
+            inject_ast_map_on_compaction=bool(data.get("inject_ast_map_on_compaction", True)),
+            strata_telemetry_enabled=bool(data.get("strata_telemetry_enabled", True)),
             unattended_auto_verify=bool(data.get("unattended_auto_verify", True)),
             auto_install_deps=bool(data.get("auto_install_deps", True)),
             temperature=float(data.get("temperature", 0.15)),

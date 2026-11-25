@@ -186,7 +186,7 @@ class PhaseManager:
                 "<tool_call>\n"
                 '{"name": "tool_name", "arguments": {"arg": "value"}}\n'
                 "</tool_call>\n"
-                "Available tools: list_dir, read_file, search_text, write_file, patch_file, "
+                "Available tools: list_dir, read_file, search_text, write_file, patch_file, delete_file, "
                 "list_skills, read_skill, lock_file, run_checks, run_terminal, complete_phase.\n"
             )
 
@@ -206,6 +206,14 @@ class PhaseManager:
             "9. When the active phase is genuinely complete and verified, call `complete_phase` with your summary, "
             "`files_to_lock`, `file_dependencies`, and `resolved_request_ids`.\n\n"
             f"### SELF-TESTING & VERIFICATION POLICY\n{auto_verify_note}\n\n"
+            "### ANTI-DRAFTING & CONTEXT HYGIENE POLICY\n"
+            "- Keep `<think>` / reasoning concise (brief outline of interfaces and edge cases only). "
+            "NEVER draft complete source files or large test suites inside `<think>`; write directly to disk "
+            "and rely on `run_checks` to catch and iterate on issues.\n"
+            "- After a context compaction reset, consult `python_ast_map` in the Machine-Verified Snapshot "
+            "instead of re-reading entire unchanged files from scratch.\n"
+            "- Use `delete_file` to remove any temporary scratch files you created (unlocked files only) "
+            "before calling `complete_phase`.\n\n"
             "### DUAL FILE-WRITING PROTOCOL (ANTI-TRUNCATION)\n"
             "- For small edits or targeted changes, use `write_file` or `patch_file`.\n"
             "- For medium/large files (>80 lines), you are STRONGLY encouraged to output files directly "

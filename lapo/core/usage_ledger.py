@@ -37,7 +37,10 @@ class UsageLedger:
             "api_base_url": config.api_base_url,
             "context_setting": config.context_setting,
             "detected_context_capacity": None,
+            "engine_version": None,
             "prompt_tokens": 0,
+            "prompt_tokens_read": 0,
+            "prompt_tokens_reused": 0,
             "completion_tokens": 0,
             "reasoning_tokens": 0,
             "reasoning_tokens_estimated": False,
@@ -49,6 +52,13 @@ class UsageLedger:
             "compaction_count": 0,
             "retry_count": 0,
             "error_count": 0,
+            "thought_watchdog_triggers": 0,
+            "history_chars_compacted": 0,
+            "drafts_offered": 0,
+            "drafts_accepted": 0,
+            "strata_metrics_start": None,
+            "strata_metrics_end": None,
+            "strata_telemetry_delta": None,
             "known_blockers": [],
             "unverified_items": [],
         }
@@ -62,7 +72,12 @@ class UsageLedger:
     def save(self) -> None:
         atomic_write_json(self.config.usage_file, self.data)
 
-    def mark_started(self, detected_ctx: Optional[int] = None) -> None:
+    def mark_started(
+        self,
+        detected_ctx: Optional[int] = None,
+        engine_version: Optional[str] = None,
+        strata_metrics_snapshot: Optional[Dict[str, Any]] = None,
+    ) -> None:
         if not self.data.get("started_at"):
             self.data["started_at"] = utc_now_iso()
             self.data["start_epoch"] = time.time()
@@ -71,6 +86,12 @@ class UsageLedger:
         self.data["context_setting"] = self.config.context_setting
         if detected_ctx:
             self.data["detected_context_capacity"] = detected_ctx
+        if engine_version:
+            self.data["engine_version"] = engine_version
+        if isinstance(strata_metrics_snapshot, dict) and self.data.get("strata_metrics_start") is None:
+            totals = strata_metrics_snapshot.get("totals")
+            if isinstance(totals, dict):
+                self.data["strata_metrics_start"] = dict(totals)
         self.save()
 
     def mark_finished(self) -> None:
@@ -93,10 +114,21 @@ class UsageLedger:
         self.data["request_count"] += 1
         self.data["retry_count"] += max(0, int(retries_used))
 
-        # 1. Prompt tokens (Read)
+        # 1. Prompt tokens (Read vs Reused)
         prompt_tok = int(usage.get("prompt_tokens") or 0)
-        if prompt_tok == 0 and isinstance(timings, dict):
-            prompt_tok = int(timings.get("prompt_n") or 0) + int(timings.get("cache_n") or 0)
+        reused_tok = 0
+        read_tok = 0
+        prompt_details = usage.get("prompt_tokens_details") or {}
+        if isinstance(prompt_details, dict) and prompt_details.get("cached_tokens") is not None:
+            reused_tok = max(0, int(prompt_details.get("cached_tokens") or 0))
+            read_tok = max(0, prompt_tok - reused_tok)
+        elif isinstance(timings, dict) and ("prompt_n" in timings or "cache_n" in timings):
+            reused_tok = max(0, int(timings.get("cache_n") or 0))
+            read_tok = max(0, int(timings.get("prompt_n") or 0))
+            if prompt_tok == 0:
+                prompt_tok = read_tok + reused_tok
+        else:
+            read_tok = prompt_tok
 
         # 2. Completion tokens (Write + possibly Think)
         comp_tok = int(usage.get("completion_tokens") or 0)
@@ -129,6 +161,8 @@ class UsageLedger:
             included_in_comp = True
 
         self.data["prompt_tokens"] += prompt_tok
+        self.data["prompt_tokens_read"] = int(self.data.get("prompt_tokens_read") or 0) + read_tok
+        self.data["prompt_tokens_reused"] = int(self.data.get("prompt_tokens_reused") or 0) + reused_tok
         self.data["completion_tokens"] += comp_tok
         self.data["reasoning_tokens"] += r_tok
         self.data["reasoning_included_in_completion"] = included_in_comp
@@ -152,6 +186,52 @@ class UsageLedger:
 
     def record_compaction(self) -> None:
         self.data["compaction_count"] += 1
+        self.save()
+
+    def record_watchdog_trigger(self) -> None:
+        self.data["thought_watchdog_triggers"] = int(self.data.get("thought_watchdog_triggers") or 0) + 1
+        self.save()
+
+    def record_history_compaction_savings(self, chars_saved: int) -> None:
+        if chars_saved > 0:
+            self.data["history_chars_compacted"] = int(self.data.get("history_chars_compacted") or 0) + int(chars_saved)
+            self.save()
+
+    def record_strata_metrics_end(self, strata_metrics_snapshot: Optional[Dict[str, Any]]) -> None:
+        if not isinstance(strata_metrics_snapshot, dict):
+            return
+        end_t = strata_metrics_snapshot.get("totals")
+        if not isinstance(end_t, dict):
+            return
+        self.data["strata_metrics_end"] = dict(end_t)
+        start_t = self.data.get("strata_metrics_start") or {}
+        if not isinstance(start_t, dict):
+            start_t = {}
+        same_epoch = (start_t.get("since") == end_t.get("since")) and (end_t.get("requests", 0) >= start_t.get("requests", 0))
+        base = start_t if same_epoch else {}
+        d_prompt = max(0, int(end_t.get("prompt_tokens") or 0) - int(base.get("prompt_tokens") or 0))
+        d_reused = max(0, int(end_t.get("reused") or 0) - int(base.get("reused") or 0))
+        d_read = max(0, d_prompt - d_reused)
+        d_out = max(0, int(end_t.get("output_tokens") or 0) - int(base.get("output_tokens") or 0))
+        d_dec_ms = max(0.0, float(end_t.get("decode_ms") or 0.0) - float(base.get("decode_ms") or 0.0))
+        d_off = max(0, int(end_t.get("drafts_offered") or 0) - int(base.get("drafts_offered") or 0))
+        d_acc = max(0, int(end_t.get("drafts_accepted") or 0) - int(base.get("drafts_accepted") or 0))
+        self.data["drafts_offered"] = d_off
+        self.data["drafts_accepted"] = d_acc
+        self.data["strata_telemetry_delta"] = {
+            "prompt_tokens": d_prompt,
+            "prompt_tokens_read": d_read,
+            "prompt_tokens_reused": d_reused,
+            "prompt_reuse_pct": round((d_reused / float(d_prompt)) * 100.0, 2) if d_prompt > 0 else 0.0,
+            "output_tokens": d_out,
+            "weighted_decode_tok_s": round(d_out / (d_dec_ms / 1000.0), 2) if d_dec_ms > 0 else 0.0,
+            "drafts_offered": d_off,
+            "drafts_accepted": d_acc,
+            "draft_accept_pct": round((d_acc / float(d_off)) * 100.0, 2) if d_off > 0 else 0.0,
+        }
+        if d_prompt > 0:
+            self.data["prompt_tokens_read"] = d_read
+            self.data["prompt_tokens_reused"] = d_reused
         self.save()
 
     def record_error(self, message: str) -> None:
@@ -215,11 +295,14 @@ class UsageLedger:
             "duration_seconds": duration_s,
             "duration_minutes": duration_min,
             "active_model": self.data["active_model"],
+            "engine_version": self.data.get("engine_version"),
             "api_base_url": self.data["api_base_url"],
             "context_setting": self.data["context_setting"],
             "detected_context_capacity": self.data["detected_context_capacity"],
             "tokens": {
                 "input_read_tokens": prompt_tok,
+                "prompt_tokens_read": int(self.data.get("prompt_tokens_read") or 0),
+                "prompt_tokens_reused": int(self.data.get("prompt_tokens_reused") or 0),
                 "completion_total_tokens": comp_tok,
                 "reasoning_think_tokens": reason_tok,
                 "output_write_tokens_excluding_reasoning": output_non_reasoning,
@@ -234,7 +317,10 @@ class UsageLedger:
                 "compaction_count": self.data["compaction_count"],
                 "retry_count": self.data["retry_count"],
                 "error_count": self.data["error_count"],
+                "thought_watchdog_triggers": int(self.data.get("thought_watchdog_triggers") or 0),
+                "history_chars_compacted": int(self.data.get("history_chars_compacted") or 0),
             },
+            "strata_telemetry": self.data.get("strata_telemetry_delta"),
             "phases": phase_reports,
             "files_created_or_modified": sorted(all_modified),
             "locked_files": locked_files,
@@ -256,7 +342,9 @@ class UsageLedger:
             f"- **Context Config:** `{report_obj['context_setting']}` (Detected: `{report_obj['detected_context_capacity']}`)",
             "",
             "## Token Consumption (No Double-Counting)",
-            f"- **Read (Input/Prompt):** {prompt_tok:,} ({format_token_count(prompt_tok)})",
+            f"- **Read (Input/Prompt Total):** {prompt_tok:,} ({format_token_count(prompt_tok)}) — "
+            f"Newly Read: {int(self.data.get('prompt_tokens_read') or 0):,} | "
+            f"Cache Reused: {int(self.data.get('prompt_tokens_reused') or 0):,}",
             f"- **Think (Reasoning{reason_label}):** {reason_tok:,} ({format_token_count(reason_tok)})",
             f"- **Write (Output excl. Reasoning):** {output_non_reasoning:,} ({format_token_count(output_non_reasoning)})",
             f"- **Completion Total:** {comp_tok:,} ({format_token_count(comp_tok)})",
@@ -268,6 +356,8 @@ class UsageLedger:
             f"- **Inline `<file>` Writes:** {self.data['inline_files_written']}",
             f"- **Context Compactions:** {self.data['compaction_count']}",
             f"- **Retries / Errors:** {self.data['retry_count']} / {self.data['error_count']}",
+            f"- **Thought Watchdog Triggers:** {int(self.data.get('thought_watchdog_triggers') or 0)}",
+            f"- **History Chars Compacted (Append-Only Hygiene):** {int(self.data.get('history_chars_compacted') or 0):,}",
             "",
             "## Phase-by-Phase Results",
         ]

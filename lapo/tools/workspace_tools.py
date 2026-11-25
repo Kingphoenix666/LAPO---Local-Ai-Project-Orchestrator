@@ -109,6 +109,24 @@ TOOLS_SCHEMA: List[Dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "delete_file",
+            "description": (
+                "Safely delete an unlocked temporary or obsolete file inside the workspace. "
+                "Automatically creates a backup before deletion. Locked files and directories are rejected."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Relative path of the unlocked file to delete."},
+                    "reason": {"type": "string", "description": "Brief reason for deleting this file."},
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "list_skills",
             "description": "List reference skill/guideline files inside the read-only Skills directory.",
             "parameters": {
@@ -553,7 +571,27 @@ class WorkspaceTools:
                     },
                     ensure_ascii=False,
                 )
-
+            if name == "delete_file":
+                target, rel_posix = self._resolve_workspace_path(args["path"], allow_root=False)
+                if not target.exists():
+                    return json.dumps({"error": f"File not found: {rel_posix}"}, ensure_ascii=False)
+                if target.is_dir():
+                    return json.dumps({"error": f"Cannot delete directory via delete_file: {rel_posix}"}, ensure_ascii=False)
+                allowed, reason_msg = self.lock_manager.check_delete_permission(rel_posix)
+                if not allowed:
+                    raise PermissionError(reason_msg)
+                backup_name = self._backup_existing_file(target, rel_posix)
+                target.unlink()
+                return json.dumps(
+                    {
+                        "status": "deleted",
+                        "path": rel_posix,
+                        "backup": backup_name,
+                        "reason": str(args.get("reason", "")).strip()[:200],
+                        "worktree_fingerprint": self.verification_manager.compute_worktree_fingerprint(),
+                    },
+                    ensure_ascii=False,
+                )
             if name == "list_skills":
                 target, rel_posix = self._resolve_skills_path(args.get("path", "."), allow_root=True)
                 if not target.is_dir():
