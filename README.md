@@ -20,7 +20,8 @@
 </div>
 
 
-<img width="1525" height="1038" alt="LAPO" src="https://github.com/user-attachments/assets/e809c572-6d44-46cb-9523-de88ce419010" />
+<img width="2560" height="1392" alt="LAPO_V1 1 0" src="https://github.com/user-attachments/assets/6a296a54-0eca-4d6f-b6eb-4afa1fed70c0" />
+
 
 
 ---
