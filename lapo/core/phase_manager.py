@@ -164,7 +164,8 @@ class PhaseManager:
     def build_system_prompt(self, tool_protocol: str = "auto") -> str:
         skills_note = (
             f"A read-only Skills directory is configured at `{self.config.skills_dir}`. "
-            "Use `list_skills` and `read_skill` to consult guidelines before designing or coding."
+            "Use `list_skills` and `read_skill` (with optional `start_line` and `end_line` for large files) "
+            "to consult guidelines before designing or coding."
             if self.config.skills_dir
             else "No external Skills directory is configured for this run."
         )
@@ -187,7 +188,7 @@ class PhaseManager:
                 '{"name": "tool_name", "arguments": {"arg": "value"}}\n'
                 "</tool_call>\n"
                 "Available tools: list_dir, read_file, search_text, write_file, patch_file, delete_file, "
-                "list_skills, read_skill, lock_file, run_checks, run_terminal, complete_phase.\n"
+                "list_backups, restore_backup, list_skills, read_skill, lock_file, run_checks, run_terminal, complete_phase.\n"
             )
 
         return (
@@ -205,13 +206,18 @@ class PhaseManager:
             "8. Never fabricate test or verification results; always report blockers honestly.\n"
             "9. When the active phase is genuinely complete and verified, call `complete_phase` with your summary, "
             "`files_to_lock`, `file_dependencies`, and `resolved_request_ids`.\n\n"
-            f"### SELF-TESTING & VERIFICATION POLICY\n{auto_verify_note}\n\n"
+            f"### SELF-TESTING & VERIFICATION POLICY\n{auto_verify_note}\n"
+            "- When writing contract, audit, or guard tests that will be locked across phases, pin exported symbols, "
+            "interfaces, or runtime behavior — NEVER pin fragile exact line numbers of source files scheduled for "
+            "modification in later phases.\n\n"
             "### ANTI-DRAFTING & CONTEXT HYGIENE POLICY\n"
             "- Keep `<think>` / reasoning concise (brief outline of interfaces and edge cases only). "
             "NEVER draft complete source files or large test suites inside `<think>`; write directly to disk "
             "and rely on `run_checks` to catch and iterate on issues.\n"
             "- After a context compaction reset, consult `python_ast_map` in the Machine-Verified Snapshot "
             "instead of re-reading entire unchanged files from scratch.\n"
+            "- History entries marked `[compacted from history by LAPO ...]` are display-only token-saving stubs; "
+            "the full content was already sent and persisted to disk (trust the tool result instead of re-reading).\n"
             "- Use `delete_file` to remove any temporary scratch files you created (unlocked files only) "
             "before calling `complete_phase`.\n\n"
             "### DUAL FILE-WRITING PROTOCOL (ANTI-TRUNCATION)\n"
@@ -222,7 +228,10 @@ class PhaseManager:
             "// complete file contents\n"
             "</file>\n"
             "The Orchestrator extracts every `<file path=\"...\">...</file>` block, enforces all lock/path "
-            "security rules, writes it atomically to disk, and reports back immediately.\n\n"
+            "security rules, writes it atomically to disk, and reports back immediately.\n"
+            "- Shrink Guard blocks accidental >45% size drops when overwriting existing files (>=4KB) unless "
+            "`allow_shrink=true` is explicitly set. If a file is accidentally truncated or regresses, use "
+            "`list_backups` and `restore_backup` to revert safely.\n\n"
             f"### SKILLS ACCESS\n{skills_note}\n"
             f"{text_tool_clause}"
         )

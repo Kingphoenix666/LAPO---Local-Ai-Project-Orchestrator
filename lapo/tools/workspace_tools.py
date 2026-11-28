@@ -23,6 +23,8 @@ PROTECTED_ROOT_NAMES = {".orchestrator", ".git"}
 IGNORED_DIR_NAMES = {"node_modules", ".git", ".orchestrator", "__pycache__", ".venv", "venv", "dist", "build"}
 PLACEHOLDER_MAX_CHARS = 100
 PLACEHOLDER_MARKERS = ("export {};", "TODO", "Pending phase implementation", "pass")
+SHRINK_GUARD_MIN_EXISTING_BYTES = 4096
+SHRINK_GUARD_MAX_DROP_RATIO = 0.45  # Block >45% size drop on files >=4KB unless allow_shrink=True
 
 
 TOOLS_SCHEMA: List[Dict[str, Any]] = [
@@ -78,13 +80,18 @@ TOOLS_SCHEMA: List[Dict[str, Any]] = [
                 "Create a new file (or overwrite an unlocked file after reading it). "
                 "For large multi-line files (>80 lines), you may instead emit "
                 '<file path="relative/path.ext">...full code...</file> directly in your assistant response '
-                "to avoid JSON escaping truncation."
+                "to avoid JSON escaping truncation. Overwriting an existing file (>=4KB) with >45% smaller content "
+                "is blocked by Shrink Guard unless allow_shrink=true is explicitly set."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "path": {"type": "string"},
                     "content": {"type": "string"},
+                    "allow_shrink": {
+                        "type": "boolean",
+                        "description": "Set true only when intentionally shrinking an existing file (>=4KB) by >45%.",
+                    },
                 },
                 "required": ["path", "content"],
             },
@@ -127,6 +134,43 @@ TOOLS_SCHEMA: List[Dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "list_backups",
+            "description": (
+                "List automatic file backups created by LAPO before overwrites, patches, or deletions. "
+                "Optionally filter by relative workspace file path."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Optional relative workspace path to filter backups for that file.",
+                    }
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "restore_backup",
+            "description": (
+                "Safely restore an unlocked workspace file from a LAPO backup created earlier. "
+                "Use backup_name returned by write_file/patch_file/delete_file or list_backups."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Relative workspace path of the file to restore."},
+                    "backup_name": {"type": "string", "description": "Exact backup filename from LAPO backups."},
+                },
+                "required": ["path", "backup_name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "list_skills",
             "description": "List reference skill/guideline files inside the read-only Skills directory.",
             "parameters": {
@@ -141,10 +185,17 @@ TOOLS_SCHEMA: List[Dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "read_skill",
-            "description": "Read a reference file from the read-only Skills directory.",
+            "description": (
+                "Read a reference file from the read-only Skills directory "
+                "(optionally bounded by 1-based start_line and end_line for large files)."
+            ),
             "parameters": {
                 "type": "object",
-                "properties": {"path": {"type": "string"}},
+                "properties": {
+                    "path": {"type": "string"},
+                    "start_line": {"type": "integer", "minimum": 1},
+                    "end_line": {"type": "integer", "minimum": 1},
+                },
                 "required": ["path"],
             },
         },
@@ -346,7 +397,13 @@ class WorkspaceTools:
     # ------------------------------------------------------------------
     # Unified Safe Write (Used by both `write_file` and Inline `<file>`)
     # ------------------------------------------------------------------
-    def _perform_safe_write(self, rel_path: str, content: str, source: str) -> Dict[str, Any]:
+    def _perform_safe_write(
+        self,
+        rel_path: str,
+        content: str,
+        source: str,
+        allow_shrink: bool = False,
+    ) -> Dict[str, Any]:
         target, rel_posix = self._resolve_workspace_path(rel_path)
         self._validate_content_safety(content)
 
@@ -361,6 +418,21 @@ class WorkspaceTools:
         if not allowed:
             raise PermissionError(reason)
 
+        new_bytes = len(content.encode("utf-8"))
+        if is_existing and not is_placeholder and not allow_shrink:
+            old_bytes = target.stat().st_size
+            min_allowed_bytes = int(old_bytes * (1.0 - SHRINK_GUARD_MAX_DROP_RATIO))
+            if old_bytes >= SHRINK_GUARD_MIN_EXISTING_BYTES and new_bytes < min_allowed_bytes:
+                old_lines = len(target.read_text(encoding="utf-8", errors="replace").splitlines())
+                new_lines = len(content.splitlines())
+                drop_pct = round((1.0 - (new_bytes / old_bytes)) * 100.0, 1)
+                raise ValueError(
+                    f"SHRINK_GUARD_BLOCKED: Refused to overwrite '{rel_posix}' because content shrank by "
+                    f"{drop_pct}% ({old_bytes} bytes / {old_lines} lines -> {new_bytes} bytes / {new_lines} lines). "
+                    "This usually indicates accidental output truncation. Use patch_file for targeted edits, "
+                    'or pass allow_shrink=true (or <file path="..." allow_shrink="true">) if this deletion is intentional.'
+                )
+
         backup_name = self._backup_existing_file(target, rel_posix) if (is_existing and not is_placeholder) else None
         atomic_write_text(target, content)
 
@@ -370,14 +442,17 @@ class WorkspaceTools:
             self._on_file_modified(rel_posix)
 
         fp = self.verification_manager.compute_worktree_fingerprint()
-        result = {
+        result: Dict[str, Any] = {
             "status": "ok",
             "source": source,
             "path": rel_posix,
-            "bytes_written": len(content.encode("utf-8")),
+            "bytes_written": new_bytes,
+            "lines_written": len(content.splitlines()),
             "backup": backup_name,
             "worktree_fingerprint": fp,
         }
+        if backup_name:
+            result["restore_hint"] = f"Use restore_backup(path='{rel_posix}', backup_name='{backup_name}') to revert."
         return result
 
     def extract_and_write_inline_files(self, assistant_text: str) -> Tuple[List[str], List[Dict[str, str]]]:
@@ -395,7 +470,12 @@ class WorkspaceTools:
 
         for block in blocks:
             try:
-                res = self._perform_safe_write(block.path, block.content, source=block.format_kind)
+                res = self._perform_safe_write(
+                    block.path,
+                    block.content,
+                    source=block.format_kind,
+                    allow_shrink=block.allow_shrink,
+                )
                 written.append(res["path"])
                 self.events.emit(
                     EventType.INLINE_FILE_WRITTEN,
@@ -452,21 +532,22 @@ class WorkspaceTools:
                 raw_text = target.read_text(encoding="utf-8", errors="replace")
                 self.lock_manager.record_read(rel_posix)
 
+                lines = raw_text.splitlines(keepends=True)
+                total_lines = len(lines)
                 start_line = args.get("start_line")
                 end_line = args.get("end_line")
                 if start_line is not None or end_line is not None:
-                    lines = raw_text.splitlines(keepends=True)
                     s_idx = max(1, int(start_line or 1)) - 1
-                    e_idx = int(end_line) if end_line is not None else len(lines)
-                    sliced = "".join(lines[s_idx:e_idx])
-                    out = sliced
+                    e_idx = int(end_line) if end_line is not None else total_lines
+                    out = "".join(lines[s_idx:e_idx])
                 else:
                     out = raw_text
 
                 if len(out) > self.config.max_tool_output_chars:
                     out = (
                         out[: self.config.max_tool_output_chars]
-                        + f"\n...[TRUNCATED AT {self.config.max_tool_output_chars} CHARS — use start_line/end_line]..."
+                        + f"\n...[TRUNCATED AT {self.config.max_tool_output_chars} CHARS | total_lines={total_lines} "
+                        f"— use start_line/end_line]..."
                     )
                 return out
 
@@ -505,7 +586,12 @@ class WorkspaceTools:
                 return json.dumps({"matches": matches, "truncated": False}, ensure_ascii=False)
 
             if name == "write_file":
-                res = self._perform_safe_write(args["path"], args["content"], source="write_file")
+                res = self._perform_safe_write(
+                    args["path"],
+                    args["content"],
+                    source="write_file",
+                    allow_shrink=bool(args.get("allow_shrink", False)),
+                )
                 return json.dumps(res, ensure_ascii=False)
 
             if name == "patch_file":
@@ -592,6 +678,92 @@ class WorkspaceTools:
                     },
                     ensure_ascii=False,
                 )
+
+            if name == "list_backups":
+                backups_dir = self.config.backups_dir
+                if not backups_dir.is_dir():
+                    return json.dumps({"backups": []}, ensure_ascii=False)
+
+                filter_suffix: Optional[str] = None
+                filter_path = str(args.get("path", "") or "").strip()
+                if filter_path:
+                    _, rel_filter = self._resolve_workspace_path(filter_path, allow_root=False)
+                    filter_suffix = "_" + rel_filter.replace("/", "__").replace("\\", "__")
+
+                items: List[Dict[str, Any]] = []
+                for p in sorted(backups_dir.iterdir(), key=lambda x: x.name, reverse=True):
+                    if not p.is_file():
+                        continue
+                    if filter_suffix and not p.name.endswith(filter_suffix):
+                        continue
+                    parts = p.name.split("_", 1)
+                    inferred = parts[1].replace("__", "/") if len(parts) == 2 else p.name
+                    items.append(
+                        {
+                            "backup_name": p.name,
+                            "inferred_path": inferred,
+                            "size_bytes": p.stat().st_size,
+                        }
+                    )
+                    if len(items) >= 30:
+                        break
+                return json.dumps({"backups": items}, ensure_ascii=False)
+
+            if name == "restore_backup":
+                target, rel_posix = self._resolve_workspace_path(args["path"], allow_root=False)
+                raw_backup = str(args.get("backup_name", "") or "").strip()
+                if not raw_backup or Path(raw_backup).name != raw_backup or "/" in raw_backup or "\\" in raw_backup:
+                    raise PermissionError("Invalid backup_name.")
+
+                backups_root = self.config.backups_dir.resolve()
+                backup_file = (backups_root / raw_backup).resolve()
+                try:
+                    backup_file.relative_to(backups_root)
+                except ValueError:
+                    raise PermissionError("Backup path traversal blocked.")
+                if not backup_file.is_file():
+                    return json.dumps({"error": f"Backup not found: {raw_backup}"}, ensure_ascii=False)
+
+                safe_name = rel_posix.replace("/", "__").replace("\\", "__")
+                if not re.fullmatch(r"\d+_" + re.escape(safe_name), raw_backup):
+                    raise PermissionError(
+                        f"Backup '{raw_backup}' does not match target path '{rel_posix}'."
+                    )
+
+                is_existing = target.is_file()
+                is_placeholder = self._is_placeholder_file(target) if is_existing else False
+                allowed, reason = self.lock_manager.check_write_permission(
+                    rel_posix,
+                    is_existing=is_existing,
+                    is_placeholder=is_placeholder,
+                )
+                if not allowed:
+                    raise PermissionError(reason)
+
+                restored_content = backup_file.read_text(encoding="utf-8", errors="replace")
+                self._validate_content_safety(restored_content)
+                pre_restore_backup = (
+                    self._backup_existing_file(target, rel_posix) if (is_existing and not is_placeholder) else None
+                )
+                atomic_write_text(target, restored_content)
+                self.lock_manager.mark_modified(rel_posix)
+                self.lock_manager.record_read(rel_posix)
+                if self._on_file_modified:
+                    self._on_file_modified(rel_posix)
+
+                return json.dumps(
+                    {
+                        "status": "restored",
+                        "path": rel_posix,
+                        "restored_from": raw_backup,
+                        "previous_state_backup": pre_restore_backup,
+                        "bytes_restored": len(restored_content.encode("utf-8")),
+                        "lines_restored": len(restored_content.splitlines()),
+                        "worktree_fingerprint": self.verification_manager.compute_worktree_fingerprint(),
+                    },
+                    ensure_ascii=False,
+                )
+
             if name == "list_skills":
                 target, rel_posix = self._resolve_skills_path(args.get("path", "."), allow_root=True)
                 if not target.is_dir():
@@ -607,10 +779,26 @@ class WorkspaceTools:
                 target, rel_posix = self._resolve_skills_path(args["path"], allow_root=False)
                 if not target.is_file():
                     return json.dumps({"error": f"Skill file not found: {rel_posix}"})
-                content = target.read_text(encoding="utf-8", errors="replace")
-                if len(content) > self.config.max_tool_output_chars:
-                    content = content[: self.config.max_tool_output_chars] + "\n...[TRUNCATED]..."
-                return content
+                raw_text = target.read_text(encoding="utf-8", errors="replace")
+                lines = raw_text.splitlines(keepends=True)
+                total_lines = len(lines)
+
+                start_line = args.get("start_line")
+                end_line = args.get("end_line")
+                if start_line is not None or end_line is not None:
+                    s_idx = max(1, int(start_line or 1)) - 1
+                    e_idx = int(end_line) if end_line is not None else total_lines
+                    out = "".join(lines[s_idx:e_idx])
+                else:
+                    out = raw_text
+
+                if len(out) > self.config.max_tool_output_chars:
+                    out = (
+                        out[: self.config.max_tool_output_chars]
+                        + f"\n...[TRUNCATED AT {self.config.max_tool_output_chars} CHARS | total_lines={total_lines} "
+                        f"— use read_skill('{rel_posix}', start_line=..., end_line=...) to read chunks]..."
+                    )
+                return out
 
             if name == "lock_file":
                 target, rel_posix = self._resolve_workspace_path(args["path"])

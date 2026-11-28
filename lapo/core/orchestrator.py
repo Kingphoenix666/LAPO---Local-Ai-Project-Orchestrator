@@ -377,6 +377,12 @@ class ProjectOrchestrator:
             repair_queue=self.lock_manager.list_repair_queue_dicts(),
             continuation_report=continuation_report,
         )
+        handoff = (
+            handoff.rstrip()
+            + "\n\n[ACTIVE TASK — START IMMEDIATELY]\n"
+            + f"You are actively executing Phase {active.id}: '{active.name}'. "
+            + "Do NOT pause or wait for another user prompt — begin executing workspace tools for this phase immediately."
+        )
         msgs = [
             {"role": "system", "content": self._system_prompt},
             {"role": "user", "content": handoff},
@@ -440,8 +446,9 @@ class ProjectOrchestrator:
                     c_body = parsed_args["content"]
                     path_lbl = str(parsed_args.get("path") or "unknown")
                     receipt = (
-                        f"[compacted from history: {len(c_body)} chars, "
-                        f"{c_body.count(chr(10)) + 1} lines for {path_lbl}; see tool result]"
+                        f"[compacted from history: actual {len(c_body)} chars, "
+                        f"{c_body.count(chr(10)) + 1} lines for {path_lbl} were ALREADY sent & written to disk; "
+                        f"this stub is display-only to save tokens — do NOT re-read or doubt this write unless tool result reported an error]"
                     )
                     compact_args = json.dumps({"path": path_lbl, "content": receipt}, ensure_ascii=False)
                     chars_stripped += max(0, len(raw_args) - len(compact_args))
@@ -457,13 +464,13 @@ class ProjectOrchestrator:
                     if len(body) <= 1200:
                         return match.group(0)
                     rep = (
-                        f'<file path="{fpath}">[compacted from history: {len(body)} chars, '
-                        f'{body.count(chr(10)) + 1} lines written to disk]</file>'
+                        f'<file path="{fpath}">[compacted from history: actual {len(body)} chars, '
+                        f'{body.count(chr(10)) + 1} lines were ALREADY written to disk; display-only stub]</file>'
                     )
                     chars_stripped += max(0, len(match.group(0)) - len(rep))
                     return rep
                 content_val = re.sub(
-                    r'<file\s+path=["\']([^"\']+)["\']\s*>(.*?)</file>',
+                    r'<file\s+[^>]*\bpath=["\']([^"\']+)["\'][^>]*>(.*?)</file>',
                     _compact_inline,
                     content_val,
                     flags=re.DOTALL,
@@ -537,14 +544,47 @@ class ProjectOrchestrator:
             level="warning",
         )
 
-    # ------------------------------------------------------------------
+    def _record_edit_and_check_thrashing(
+        self,
+        file_edit_streak: Dict[str, int],
+        paths: List[str],
+    ) -> Optional[str]:
+        """Detect repetitive edit/rewrite loops on the same file without passing checks."""
+        flagged: List[Tuple[str, int]] = []
+        for raw_p in paths:
+            p = (raw_p or "").strip().replace("\\", "/")
+            if not p:
+                continue
+            count = file_edit_streak.get(p, 0) + 1
+            file_edit_streak[p] = count
+            if count >= 4 and count % 2 == 0:
+                flagged.append((p, count))
+
+        if not flagged:
+            return None
+
+        summary = ", ".join(f"'{p}' ({n} edits)" for p, n in flagged)
+        self.events.emit(
+            EventType.LOG,
+            f"[ANTI-THRASHING GUARD] Repeated edits without passing checks on: {summary}",
+            level="warning",
+        )
+        return (
+            f"[ORCHESTRATOR ANTI-THRASHING GUARD] You have edited {summary} repeatedly in this phase "
+            "without passing verification checks. STOP micro-tweaking line numbers, comments, or retrying "
+            "the exact same approach in a loop. Step back, inspect the root cause of the failing assertion, "
+            "switch strategy, use `restore_backup` if a file regressed, or report an explicit blocker if a "
+            "locked prior-phase contract prevents progress."
+        )
+
+# ------------------------------------------------------------------
     # Main Autonomous Execution Entrypoint
     # ------------------------------------------------------------------
     def run(
         self,
         raw_phases: Optional[List[Dict[str, Any]]] = None,
         resume: bool = False,
-        max_turns: int = 500,
+        max_turns: int = 5000,
     ) -> Dict[str, Any]:
         self._stop_event.clear()
         self._pause_event.set()
@@ -621,7 +661,18 @@ class ProjectOrchestrator:
                     ],
                     repair_queue=self.lock_manager.list_repair_queue_dicts(),
                 )
-                self._messages.append({"role": "user", "content": f"[SESSION RESUMED]\n{handoff}"})
+                resume_block = (
+                    f"[SESSION RESUMED]\n{handoff}\n\n"
+                    f"[ACTIVE TASK — RESUME IMMEDIATELY]\n"
+                    f"You are actively executing Phase {active.id}: '{active.name}'. "
+                    "Do NOT pause or wait for another user prompt — resume tool execution immediately."
+                )
+                if self._messages and self._messages[-1].get("role") == "user":
+                    self._messages[-1]["content"] = (
+                        (self._messages[-1].get("content") or "").rstrip() + "\n\n" + resume_block
+                    )
+                else:
+                    self._messages.append({"role": "user", "content": resume_block})
                 self.recovery_manager.save_journal(self._messages)
                 self.events.emit(
                     EventType.LOG,
@@ -645,6 +696,7 @@ class ProjectOrchestrator:
             compaction_prev_tokens = 0
             consecutive_json_errors = 0
             consecutive_watchdog_hits = 0
+            file_edit_streak: Dict[str, int] = {}
             turns = 0
 
             while not self._stop_event.is_set() and not self._project_finished and turns < max_turns:
@@ -729,6 +781,7 @@ class ProjectOrchestrator:
                     awaiting_compaction = False
                     compaction_prev_tokens = 0
                     consecutive_json_errors = 0
+                    file_edit_streak.clear()
                     self.context_manager.reset_tracking()
 
                     fresh_tok, fresh_exact = self.context_manager.count_messages_tokens(
@@ -803,11 +856,22 @@ class ProjectOrchestrator:
 
                 if native_tool_calls:
                     self.usage_ledger.record_tool_calls(len(native_tool_calls))
+                    turn_edited_paths: List[str] = list(inline_written) + [
+                        e.get("path", "") for e in inline_errors if e.get("path")
+                    ]
+                    checks_passed_this_turn = False
                     for tc in native_tool_calls:
                         fn_name = (tc.get("function") or {}).get("name") or ""
                         raw_args = (tc.get("function") or {}).get("arguments") or "{}"
 
-                        if fn_name in ("write_file", "patch_file", "run_checks", "run_terminal", "complete_phase"):
+                        if fn_name in (
+                            "write_file",
+                            "patch_file",
+                            "restore_backup",
+                            "run_checks",
+                            "run_terminal",
+                            "complete_phase",
+                        ):
                             wrote_or_tested = True
 
                         try:
@@ -819,6 +883,17 @@ class ProjectOrchestrator:
                                 data={"name": fn_name, "arguments": fn_args},
                             )
                             tool_output = self.tools.execute(fn_name, fn_args)
+                            if fn_name in ("write_file", "patch_file", "restore_backup") and isinstance(fn_args, dict):
+                                p_arg = str(fn_args.get("path") or "").strip()
+                                if p_arg:
+                                    turn_edited_paths.append(p_arg)
+                            elif fn_name == "run_checks":
+                                try:
+                                    chk_obj = json.loads(tool_output)
+                                    if isinstance(chk_obj, dict) and chk_obj.get("status") in ("passed", "auto_verified"):
+                                        checks_passed_this_turn = True
+                                except Exception:
+                                    pass
                         except json.JSONDecodeError as je:
                             consecutive_json_errors += 1
                             raw_len = len(raw_args)
@@ -854,23 +929,42 @@ class ProjectOrchestrator:
                         break
 
                     if self._phase_transitioned_this_turn:
+                        file_edit_streak.clear()
                         self._messages = self._build_fresh_phase_messages()
                         continue
 
-                    if inline_written or inline_errors:
+                    if checks_passed_this_turn:
+                        file_edit_streak.clear()
+
+                    thrash_warning = self._record_edit_and_check_thrashing(file_edit_streak, turn_edited_paths)
+
+                    if inline_written or inline_errors or thrash_warning:
                         feedback_lines = []
                         if inline_written:
                             feedback_lines.append(f"[AUTO-WRITER] Wrote inline files: {inline_written}")
                         if inline_errors:
                             feedback_lines.append(f"[AUTO-WRITER ERRORS] {json.dumps(inline_errors, ensure_ascii=False)}")
+                        if thrash_warning:
+                            feedback_lines.append(thrash_warning)
                         self._messages.append({"role": "user", "content": "\n".join(feedback_lines)})
 
                 elif text_tool_calls:
                     consecutive_json_errors = 0
                     self.usage_ledger.record_tool_calls(len(text_tool_calls))
+                    turn_edited_paths = list(inline_written) + [
+                        e.get("path", "") for e in inline_errors if e.get("path")
+                    ]
+                    checks_passed_this_turn = False
                     results_summary: List[str] = []
                     for tc in text_tool_calls:
-                        if tc.name in ("write_file", "patch_file", "run_checks", "run_terminal", "complete_phase"):
+                        if tc.name in (
+                            "write_file",
+                            "patch_file",
+                            "restore_backup",
+                            "run_checks",
+                            "run_terminal",
+                            "complete_phase",
+                        ):
                             wrote_or_tested = True
                         self.events.emit(
                             EventType.TOOL_CALL,
@@ -878,6 +972,17 @@ class ProjectOrchestrator:
                             data={"name": tc.name, "arguments": tc.arguments},
                         )
                         out = self.tools.execute(tc.name, tc.arguments)
+                        if tc.name in ("write_file", "patch_file", "restore_backup") and isinstance(tc.arguments, dict):
+                            p_arg = str(tc.arguments.get("path") or "").strip()
+                            if p_arg:
+                                turn_edited_paths.append(p_arg)
+                        elif tc.name == "run_checks":
+                            try:
+                                chk_obj = json.loads(out)
+                                if isinstance(chk_obj, dict) and chk_obj.get("status") in ("passed", "auto_verified"):
+                                    checks_passed_this_turn = True
+                            except Exception:
+                                pass
                         results_summary.append(f'<tool_result name="{tc.name}">\n{out}\n</tool_result>')
                         if self._phase_transitioned_this_turn:
                             break
@@ -885,8 +990,16 @@ class ProjectOrchestrator:
                     if self._project_finished:
                         break
                     if self._phase_transitioned_this_turn:
+                        file_edit_streak.clear()
                         self._messages = self._build_fresh_phase_messages()
                         continue
+
+                    if checks_passed_this_turn:
+                        file_edit_streak.clear()
+
+                    thrash_warning = self._record_edit_and_check_thrashing(file_edit_streak, turn_edited_paths)
+                    if thrash_warning:
+                        results_summary.append(thrash_warning)
 
                     self._messages.append({"role": "user", "content": "\n\n".join(results_summary)})
 
@@ -898,16 +1011,27 @@ class ProjectOrchestrator:
                             parts.append(f"[AUTO-WRITER] Successfully wrote {inline_written} atomically to disk.")
                         if inline_errors:
                             parts.append(f"[AUTO-WRITER BLOCKED] {json.dumps(inline_errors, ensure_ascii=False)}")
+                        inline_paths = list(inline_written) + [
+                            e.get("path", "") for e in inline_errors if e.get("path")
+                        ]
+                        inline_checks_passed = False
                         if inline_written:
                             suite = self.verification_manager.run_phase_checks(
                                 active_phase.id,
                                 active_phase.verification_commands,
                                 modified_files=active_phase.created_or_modified_files,
                             )
+                            if suite.status in ("passed", "auto_verified"):
+                                inline_checks_passed = True
+                                file_edit_streak.clear()
                             parts.append(
                                 f"[AUTO-CHECKS Phase {active_phase.id}] status={suite.status}\n"
                                 f"{json.dumps(suite.to_dict(), indent=2, ensure_ascii=False)}"
                             )
+                        if not inline_checks_passed:
+                            thrash_warning = self._record_edit_and_check_thrashing(file_edit_streak, inline_paths)
+                            if thrash_warning:
+                                parts.append(thrash_warning)
                         parts.append(
                             f"Continue Phase {active_phase.id} ('{active_phase.name}') or call `complete_phase` when finished."
                         )

@@ -73,6 +73,7 @@ class LapoMainWindow:
         self._worker_thread: Optional[threading.Thread] = None
         self._discovered_models: Dict[str, ModelInfo] = {}
         self._loaded_allowed_commands: List[str] = []
+        self._closing: bool = False
 
         self.var_api_url = tk.StringVar(value=self.prefs.get("last_api_url") or DEFAULT_API_BASE_URL)
         self.var_api_key = tk.StringVar(value=DEFAULT_API_KEY)
@@ -881,18 +882,63 @@ class LapoMainWindow:
         self.root.after(50, self._poll_events)
 
     def _on_close(self) -> None:
-        self._persist_basic_prefs()
-        if self._orchestrator and self._orchestrator.is_running:
+        if self._closing:
+            if messagebox.askyesno(
+                "Shutdown in Progress",
+                "LAPO is currently stopping and saving state.\n\n"
+                "Force close immediately? (Not recommended while saving state.)",
+                icon=messagebox.WARNING,
+                default=messagebox.NO,
+                parent=self.root,
+            ):
+                self.root.destroy()
+            return
+
+        is_active = bool(
+            (self._orchestrator and self._orchestrator.is_running)
+            or (self._worker_thread and self._worker_thread.is_alive())
+        )
+
+        if is_active:
             if not messagebox.askyesno(
-                "Orchestrator Running",
-                "An execution session is active. Stop, save state, and exit?",
+                "Confirm Exit — Execution Running",
+                "An execution session is currently active.\n\n"
+                "Stop execution, save state for Resume, and close LAPO?",
+                icon=messagebox.WARNING,
+                default=messagebox.NO,
                 parent=self.root,
             ):
                 return
-            self._orchestrator.stop()
-            if self._worker_thread and self._worker_thread.is_alive():
-                self._worker_thread.join(timeout=3.0)
+            self._closing = True
+            self._persist_basic_prefs()
+            self.var_status.set("Status: Stopping and saving state before exit...")
+            if self._orchestrator:
+                self._orchestrator.stop()
+            self.btn_stop.configure(state="disabled")
+            self.btn_pause.configure(state="disabled")
+            self.btn_resume_run.configure(state="disabled")
+            self._wait_for_worker_and_destroy(remaining_ms=8000)
+            return
+
+        if not messagebox.askyesno(
+            "Confirm Exit",
+            "Are you sure you want to close LAPO?",
+            icon=messagebox.QUESTION,
+            default=messagebox.NO,
+            parent=self.root,
+        ):
+            return
+
+        self._closing = True
+        self._persist_basic_prefs()
         self.root.destroy()
+
+    def _wait_for_worker_and_destroy(self, remaining_ms: int) -> None:
+        if self._worker_thread and self._worker_thread.is_alive() and remaining_ms > 0:
+            self.root.after(100, lambda: self._wait_for_worker_and_destroy(remaining_ms - 100))
+            return
+        if self.root.winfo_exists():
+            self.root.destroy()
 
 
 def launch_gui() -> int:

@@ -60,6 +60,13 @@ CONTINUATION_REPORT_SCHEMA: Dict[str, Any] = {
 }
 
 
+_TS_JS_EXTENSIONS = {".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"}
+_TS_SYMBOL_RE = re.compile(
+    r"^(?:export\s+(?:default\s+)?)?(?:async\s+)?(?:abstract\s+)?"
+    r"(function|class|interface|type|enum|const)\s+([A-Za-z_$][A-Za-z0-9_$]*)"
+)
+
+
 def _compact_ast_args(args_node: ast.arguments) -> str:
     parts: List[str] = []
     for a in getattr(args_node, "posonlyargs", []):
@@ -73,51 +80,90 @@ def _compact_ast_args(args_node: ast.arguments) -> str:
     if args_node.kwarg:
         parts.append("**" + args_node.kwarg.arg)
     return ", ".join(parts[:8]) + (", ..." if len(parts) > 8 else "")
+
+
+def _extract_ts_js_symbols(text: str) -> List[str]:
+    symbols: List[str] = []
+    seen: Set[str] = set()
+    for lineno, line in enumerate(text.splitlines(), 1):
+        if not line or line[0].isspace():
+            continue
+        m = _TS_SYMBOL_RE.match(line)
+        if not m:
+            continue
+        kind, name = m.group(1), m.group(2)
+        is_exported = line.startswith("export ")
+        if kind == "const" and not is_exported and not name.isupper():
+            continue
+        prefix = "export " if is_exported else ""
+        label = f"{prefix}{kind} {name} (L{lineno})"
+        if label not in seen:
+            seen.add(label)
+            symbols.append(label)
+            if len(symbols) >= 24:
+                break
+    return symbols
+
+
 def build_workspace_ast_map(
     workspace_root: Path,
     locked_paths: Optional[Set[str]] = None,
     max_chars: int = 4500,
 ) -> Dict[str, Any]:
-    """Build a compact AST symbol map of Python workspace files to prevent post-compaction re-reads."""
+    """Build a compact symbol map of Python & TS/JS workspace files to prevent post-compaction re-reads."""
     locked_set = locked_paths or set()
     ignored = {"node_modules", ".git", ".orchestrator", "__pycache__", ".venv", "venv", "dist", "build"}
     result: Dict[str, Any] = {}
     used_chars = 2
     if not workspace_root.exists():
         return result
-    py_files: List[Path] = []
+
+    source_files: List[Path] = []
     for r_dir, dnames, fnames in os.walk(workspace_root):
         dnames[:] = [d for d in sorted(dnames) if d not in ignored]
         for fn in sorted(fnames):
-            if fn.endswith(".py"):
-                py_files.append(Path(r_dir) / fn)
-    for fp in py_files:
+            suffix = Path(fn).suffix.lower()
+            if suffix == ".py" or suffix in _TS_JS_EXTENSIONS:
+                source_files.append(Path(r_dir) / fn)
+
+    for fp in source_files:
         try:
+            size_bytes = fp.stat().st_size
+            if size_bytes > 512 * 1024:
+                continue
             rel = fp.resolve().relative_to(workspace_root.resolve()).as_posix()
             text = fp.read_text(encoding="utf-8", errors="replace")
-            tree = ast.parse(text)
         except Exception:
             continue
+
         symbols: List[str] = []
-        for node in tree.body:
-            if isinstance(node, ast.ClassDef):
-                methods = [
-                    f"{n.name}({_compact_ast_args(n.args)})"
-                    for n in node.body
-                    if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
-                ]
-                m_str = ", ".join(methods[:12]) + (f" (+{len(methods) - 12} more)" if len(methods) > 12 else "")
-                symbols.append(f"class {node.name}: {m_str}" if m_str else f"class {node.name}")
-            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                symbols.append(f"def {node.name}({_compact_ast_args(node.args)})")
-            elif isinstance(node, ast.Assign):
-                for tgt in node.targets:
-                    if isinstance(tgt, ast.Name) and (tgt.id == "__all__" or tgt.id.isupper()):
-                        symbols.append(f"const {tgt.id}")
-                        break
+        if fp.suffix.lower() == ".py":
+            try:
+                tree = ast.parse(text)
+            except Exception:
+                continue
+            for node in tree.body:
+                if isinstance(node, ast.ClassDef):
+                    methods = [
+                        f"{n.name}({_compact_ast_args(n.args)})"
+                        for n in node.body
+                        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    ]
+                    m_str = ", ".join(methods[:12]) + (f" (+{len(methods) - 12} more)" if len(methods) > 12 else "")
+                    symbols.append(f"class {node.name}: {m_str}" if m_str else f"class {node.name}")
+                elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    symbols.append(f"def {node.name}({_compact_ast_args(node.args)})")
+                elif isinstance(node, ast.Assign):
+                    for tgt in node.targets:
+                        if isinstance(tgt, ast.Name) and (tgt.id == "__all__" or tgt.id.isupper()):
+                            symbols.append(f"const {tgt.id}")
+                            break
+        else:
+            symbols = _extract_ts_js_symbols(text)
+
         entry = {
             "lines": text.count("\n") + 1,
-            "bytes": fp.stat().st_size,
+            "bytes": size_bytes,
             "locked": rel in locked_set,
             "symbols": symbols[:24],
         }
@@ -128,6 +174,8 @@ def build_workspace_ast_map(
         result[rel] = entry
         used_chars += entry_len
     return result
+
+
 def enforce_continuation_report_budget(
     report: Dict[str, Any],
     max_chars: int = 4000,
@@ -195,6 +243,8 @@ def enforce_continuation_report_budget(
         if not progressed:
             break
     return bounded, True
+
+
 def build_in_stream_compaction_signal(
     active_phase: PhaseDefinition,
     active_tokens: int,
@@ -404,6 +454,18 @@ class CompactionManager:
                 pending_requests=pending_dicts,
                 repair_queue=self.lock_manager.list_repair_queue_dicts(),
                 continuation_report=report,
+            )
+            next_act = str(report.get("next_exact_action") or "").strip()
+            handoff_msg = (
+                handoff_msg.rstrip()
+                + "\n\n[ACTIVE TASK — RESUME IMMEDIATELY]\n"
+                + f"You are actively executing Phase {active_phase.id}: '{active_phase.name}'. "
+                + "Do NOT pause or wait for a new user question — resume tool execution immediately.\n"
+                + (
+                    f"Next exact action: {next_act}"
+                    if next_act
+                    else f"Continue the remaining work for Phase {active_phase.id} using workspace tools."
+                )
             )
 
             fresh_messages: List[Dict[str, Any]] = [

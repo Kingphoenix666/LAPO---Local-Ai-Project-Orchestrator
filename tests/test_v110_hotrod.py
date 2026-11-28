@@ -40,7 +40,7 @@ class _FakeSSEResponse:
         self.closed = True
 class TestV110HotRod(unittest.TestCase):
     def test_version_and_profiles_exist(self) -> None:
-        self.assertEqual(lapo.__version__, "1.1.0")
+        self.assertEqual(lapo.__version__, "1.1.1")
         self.assertIn("gyro_m_256k_native", STRATA_HOTROD_PROFILES)
         self.assertIn("coder_iq1_m_128k", STRATA_HOTROD_PROFILES)
     def test_delete_file_unlocked_and_locked_guards(self) -> None:

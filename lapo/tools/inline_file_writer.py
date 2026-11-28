@@ -18,6 +18,7 @@ class ExtractedFileBlock:
     path: str
     content: str
     format_kind: str  # "xml_file" | "fenced_file"
+    allow_shrink: bool = False
 
 
 @dataclass
@@ -28,12 +29,15 @@ class ExtractedToolCall:
 
 
 _XML_FILE_PATTERN = re.compile(
-    r"<file\s+path=[\"']([^\"']+)[\"']\s*>\s*\n?(.*?)\n?</file>",
+    r"<file\s+([^>\n]+?)>\s*\n?(.*?)\n?</file>",
     re.DOTALL,
 )
 
+_ATTR_PATH_RE = re.compile(r"""\bpath\s*=\s*["']([^"']+)["']""")
+_ATTR_SHRINK_RE = re.compile(r"""\ballow_shrink\s*=\s*["']?(true|1|yes)["']?""", re.IGNORECASE)
+
 _FENCE_FILE_PATTERN = re.compile(
-    r"```[A-Za-z0-9_+\-\.]*\s+(?:file|path)=[\"']([^\"']+)[\"'][^\n]*\n(.*?)```",
+    r"```[A-Za-z0-9_+\-\.]*\s+((?:file|path)=[\"']([^\"']+)[\"'][^\n]*)\n(.*?)```",
     re.DOTALL,
 )
 
@@ -54,10 +58,22 @@ def extract_inline_file_blocks(text: str) -> List[ExtractedFileBlock]:
     consumed_spans: List[tuple[int, int]] = []
 
     for match in _XML_FILE_PATTERN.finditer(text):
-        rel_path = match.group(1).strip()
+        attr_str = match.group(1)
+        path_match = _ATTR_PATH_RE.search(attr_str)
+        if not path_match:
+            continue
+        rel_path = path_match.group(1).strip()
         body = match.group(2)
+        allow_shrink = bool(_ATTR_SHRINK_RE.search(attr_str))
         if rel_path:
-            blocks.append(ExtractedFileBlock(path=rel_path, content=body, format_kind="xml_file"))
+            blocks.append(
+                ExtractedFileBlock(
+                    path=rel_path,
+                    content=body,
+                    format_kind="xml_file",
+                    allow_shrink=allow_shrink,
+                )
+            )
             consumed_spans.append(match.span())
 
     def _overlaps(start: int, end: int) -> bool:
@@ -66,10 +82,19 @@ def extract_inline_file_blocks(text: str) -> List[ExtractedFileBlock]:
     for match in _FENCE_FILE_PATTERN.finditer(text):
         if _overlaps(match.start(), match.end()):
             continue
-        rel_path = match.group(1).strip()
-        body = match.group(2)
+        header_attrs = match.group(1)
+        rel_path = match.group(2).strip()
+        body = match.group(3)
+        allow_shrink = bool(_ATTR_SHRINK_RE.search(header_attrs))
         if rel_path:
-            blocks.append(ExtractedFileBlock(path=rel_path, content=body, format_kind="fenced_file"))
+            blocks.append(
+                ExtractedFileBlock(
+                    path=rel_path,
+                    content=body,
+                    format_kind="fenced_file",
+                    allow_shrink=allow_shrink,
+                )
+            )
 
     return blocks
 
